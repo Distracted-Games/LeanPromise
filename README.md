@@ -1,60 +1,119 @@
-# Roblox Project Template
+# LeanPromise
 
-This repository serves as a public template for my Roblox development setup. It includes configuration for **Rojo**, **Selene**, **Stylua**, and the **Luau Language Server**, along with a growing collection of reusable scripts and functions available to the community.
+A modern, robust, and strictly-typed Promise implementation for Luau. This library is a complete, feature-complete refactor of the popular `Promise.lua` library by evaera, architected to align with modern Luau idioms and a professional, type-safe workflow.
 
-## 🔧 Development Tools & Setup
+## 🚀 Overview
 
-This template is pre-configured to support a clean and efficient Roblox development workflow:
+`LeanPromise` is a powerful tool for managing asynchronous operations (like DataStore calls or asset loading) in a clean, non-blocking, and readable way. It transforms confusing, nested "callback hell" into clean, sequential chains of logic.
 
-- **Rojo**: Enables structured project syncing between your local filesystem and Roblox Studio.
-- **Selene**: Provides static analysis for Luau code to catch common issues early.
-- **Stylua**: Automatically formats Luau code for consistency and readability.
-- **Luau Language Server**: Offers intelligent code completion, navigation, and diagnostics.
+The library is architected as a self-contained package:
 
-## 🗂️ Project Structure & Features
+| Module | Location | Purpose |
+| :--- | :--- | :--- |
+| `init.luau` | `.../LeanPromise/` | The main entry point and the `Promise` class constructor. This is what you `require`. |
+| `PromiseError.luau` | `.../LeanPromise/` | A rich error object used for Promise rejections, providing detailed debug info. |
 
-- **Service Mapping**: The included `default.project.json` uses `"ignoreUnknownInstances": true` to prevent Rojo from removing existing Roblox instances not explicitly defined in your local project.  
-  - ⚠️ *Best Practice*: Create a `/Source` or `/src` folder within each service to separate scripts from assets and maintain a clean structure.
+## 🧠 Design Philosophy
 
-- **Stylua Configuration**: The included `stylua.toml` file ensures that required modules are sorted alphabetically, mirroring the auto-import behavior for services.
+This library was built on three core professional principles:
 
-- **`/OtherScripts` Folder**: A sandbox directory for experimental or test scripts that are not synced via Rojo.  
-  - This folder is listed in `.gitignore` but commented out by default, allowing you to opt in or out of version control.
+1.  **Asynchronous by Default**  
+    All operations that can yield are wrapped in a `Promise`. This allows you to write non-blocking code that keeps your game fast and responsive, with clear success (`:andThen`) and failure (`:catch`) paths for every operation.
 
-## 🖥️ VS Code Workspace Configuration
+2.  **Strictly Type-Safe**  
+    The entire library is written with `--!strict` and features a comprehensive, generic type system. This provides an unparalleled developer experience with full autocomplete, error checking, and confidence in your asynchronous code.
 
-The template includes a `.vscode/settings.json` file to streamline your development experience in Visual Studio Code:
+3.  **Lean and Idiomatic**  
+    The API is designed to be clean, intuitive, and aligned with modern Luau best practices. It provides the essential, powerful features of a Promise library without unnecessary bloat, making it easy to learn and maintain.
 
-- Semantic highlighting for improved readability
-- Format-on-save with Stylua for both `.lua` and `.luau` files  
-  > 💡 *Note*: Roblox scripts should use the `.luau` extension to reflect the correct language and tooling support. Many developers still use `.lua` out of habit, but `.luau` is preferred for Roblox projects.
-- Custom icon theming for common Roblox services using Material Icon Theme
-- Side-by-side diff view for easier code comparison
-- Luau Language Server enhancements for auto-imports and completion behavior
-- Rulers at 80 and 100 columns to align with Roblox Lua Style Guide
+## 📦 How to Use
 
-> These settings are designed to work out-of-the-box with the recommended extensions listed below.
+The core idea is to wrap a yielding function in a `Promise`. This immediately returns a `Promise` object that you can attach callbacks to, allowing your script to continue running without lag.
 
-### 💡 Recommended Extensions
+### Basic Example: Wrapping a DataStore Call
 
-You can optionally include a `.vscode/extensions.json` file to prompt installation of these tools:
+```lua
+--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DataStoreService = game:GetService("DataStoreService")
 
-- `evaera.vscode-rojo` — Rojo integration
-- `JohnnyMorganz.stylua` — Luau code formatter
-- `JohnnyMorganz.luau-lsp` — Luau Language Server support
-- `Kampfkarren.selene-vscode` — Selene static analysis
-- `PKief.material-icon-theme` — Custom folder icons
+local LeanPromise = require(ReplicatedStorage.Source.Libs.LeanPromise)
 
-## 📦 [Public Scripts & Functions](/PublicModules/)
+local playerData = DataStoreService:GetDataStore("PlayerData")
 
-This template also includes a selection of reusable scripts and utility functions designed to help other developers:
+local function getDataAsync(key: string): LeanPromise.Promise<any>
+	return LeanPromise.new(function(resolve, reject)
+		local success, result = pcall(function()
+			return playerData:GetAsync(key)
+		end)
 
-- Modular components for common gameplay systems
-- Utility functions for debugging, data handling, and more
-- Examples and test cases to illustrate usage
+		if success then
+			resolve(result) -- The promise succeeded.
+		else
+			reject(result) -- The promise failed.
+		end
+	end)
+end
 
-Feel free to explore, adapt, and contribute. These resources are intended to support both beginners and experienced developers working with Roblox Luau.
+-- Now, consume the promise:
+print("Requesting data...")
+getDataAsync("Player_123")
+	:andThen(function(data)
+		print(`Data loaded successfully: {data}`)
+	end)
+	:catch(function(errorMessage)
+		warn(`Error loading data: {errorMessage}`)
+	end)
+
+print("This message prints immediately, without waiting for the DataStore!")
+```
+
+## 🛠️ API Reference
+
+### Core Constructor
+| Function | Description |
+| :--- | :--- |
+| `LeanPromise.new(executor)` | Creates a new `Promise`. The `executor` function is given `resolve` and `reject` callbacks. |
+
+### Key Instance Methods
+| Method | Description |
+| :--- | :--- |
+| `promise:andThen(onFulfilled, onRejected)` | Chains onto a promise. `onFulfilled` runs on success, `onRejected` runs on failure. |
+| `promise:catch(onRejected)` | Shorthand for handling only the failure case of a promise. |
+| `promise:finally(onFinally)` | Registers a function to run when the promise settles, regardless of success or failure. |
+| `promise:cancel()` | Cancels a promise if it is still pending. |
+
+### Static Utility Functions
+| Function | Description |
+| :--- | :--- |
+| `LeanPromise.all(promises)` | Returns a new promise that resolves when **all** promises in a table have resolved. |
+| `LeanPromise.race(promises)` | Returns a new promise that resolves as soon as the **first** promise in a table resolves. |
+| `LeanPromise.resolve(value)` | Creates a new promise that is already automatically resolved with the given value. |
+| `LeanPromise.reject(reason)` | Creates a new promise that is already automatically rejected with the given reason. |
+
+## ✨ Features
+- **Clean Asynchronous Chains:** Say goodbye to nested callbacks.
+- **Robust Error Handling:** A centralized `.catch` makes handling failures trivial.
+- **Parallel Operations:** Easily run multiple async tasks at once with `LeanPromise.all`.
+- **Full Cancellation Support:** Abort pending operations to prevent memory leaks and unnecessary work.
+- **Strictly Type-Safe:** Fully generic and `--!strict` compliant for a professional workflow.
+
+## ⚠️ Important Notes
+- **Error Handling:** When using `.catch`, the rejection value may be a `PromiseError` object. To ensure it's a string for printing, use `tostring(err)`.
+- **Chaining:** If you return a new `Promise` from within an `.andThen` or `.catch` handler, the chain will intelligently wait for it to settle before continuing, allowing you to chain additional `.andThen` or `.catch` hunadlers. Also used for `.finally` handler.
+
+## 📁 Folder Placement
+To keep your project organized, we recommend placing the `LeanPromise` package in:
+
+```
+ReplicatedStorage/
+└── Source/
+    └── Libs/
+        └── LeanPromise/
+            ├── init.luau
+            └── PromiseError.luau
+```
 
 ---
 
-If you find this template useful or have suggestions for improvement, feel free to open an issue or submit a pull request!
+**LeanPromise** is designed to be a foundational tool for any professional Roblox project, enabling you to write complex, high-performance, and maintainable asynchronous code with confidence.
