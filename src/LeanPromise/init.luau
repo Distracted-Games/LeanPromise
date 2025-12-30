@@ -35,7 +35,40 @@ local PromiseError = require(script.PromiseError)
 
 type PromiseError = PromiseError.PromiseError
 
--- An enum fo rthe different states a Promise can be in.
+type ClassType<T> = {
+    -- Private properties
+    _status: string,
+    _values: { any }?,
+    _valuesLength: number,
+    _unhandledRejection: boolean,
+    _parent: Promise<T>?,
+    _reason: any?,
+    _consumers: { [Promise<T>]: boolean },
+    _fulfilledCallbacks: { (T) -> () },
+    _rejectedCallbacks: { (any) -> () },
+    _cancellationHook: (() -> ())?,
+    -- Public Methods
+    andThen: (
+        self: Promise<T>,
+        onFulfilled: ((T) -> ...any)?,
+        onRejected: ((any) -> ...any)?
+    ) -> Promise<T>,
+    catch: (self: Promise<T>, onRejected: ((any) -> ())?) -> Promise<T>,
+    finally: (self: Promise<T>, onFinally: (() -> ())?) -> Promise<T>,
+    cancel: (self: Promise<T>) -> (),
+    all: (promises: { Promise<T> }) -> Promise<T>,
+    race: (promises: { Promise<T> }) -> Promise<T>,
+    -- Constructor
+    new: (
+        executor: (
+            resolve: (...any) -> (),
+            reject: (any) -> (),
+            onCancel: ((() -> ())?) -> boolean
+        ) -> ()
+    ) -> Promise<T>,
+}
+
+-- An enum for the different states a Promise can be in.
 local Status = {
 	Started = "Started" :: "Started",
 	Resolved = "Resolved" :: "Resolved",
@@ -65,48 +98,14 @@ end
     Safely calls a function and captures its return values or error.
     We use xpcall to provide our custom error handling function.
 ]]
-local function runExecutor(traceback: string, callback: () -> ...any, ...: any): (boolean, ...any)
+local function runExecutor(traceback: string, callback: (...any) -> ...any, ...: any): (boolean, ...any)
 	return xpcall(callback, makeErrorHandler(traceback), ...)
 end
 
 local Promise = {}
 Promise.__index = Promise
 
-export type Promise<T> = typeof(setmetatable(
-	{} :: {
-		-- Private properties
-		_status: string,
-		_values: { any }?,
-		_valuesLength: number,
-		_unhandledRejection: boolean,
-		_parent: Promise<T>?,
-		_reason: any?,
-		_consumers: { [Promise<T>]: boolean },
-		_fulfilledCallbacks: { (T) -> () },
-		_rejectedCallbacks: { (any) -> () },
-		_cancellationHook: (() -> ())?,
-		-- Public Methods
-		andThen: (
-			self: Promise<T>,
-			onFulfilled: ((...T) -> any?)?,
-			onRejected: ((T) -> any?)?
-		) -> Promise<T>,
-		catch: (self: Promise<T>, onRejected: ((...T) -> ())?) -> Promise<T>,
-		finally: (self: Promise<T>, onFinally: (() -> ())?) -> Promise<T>,
-		cancel: (self: Promise<T>) -> (),
-		all: (promises: { Promise<T> }) -> Promise<T>,
-		race: (promises: { Promise<T> }) -> Promise<T>,
-		-- Constructor
-		new: (
-			executor: (
-				resolve: (...any) -> (),
-				reject: (any) -> (),
-				onCancel: ((() -> ())?) -> boolean
-			) -> ()
-		) -> Promise<T>,
-	},
-	Promise
-))
+export type Promise<T> = setmetatable<ClassType<T>, typeof(Promise)>
 
 function Promise.new<T>(
 	executor: (
@@ -219,7 +218,11 @@ local function createChainedCallback<T>(
 	end
 end
 
-function Promise.andThen(self: Promise<any>, onFulfilled: ((...any) -> any?)?, onRejected: ((any) -> any?)?): Promise<any>
+function Promise.andThen(
+	self: Promise<any>,
+	onFulfilled: ((...any) -> any?)?,
+	onRejected: ((any) -> any?)?
+): Promise<any>
 	if self._status == Status.Cancelled then
 		local p = Promise.new(function() end)
 		p:cancel()
@@ -287,7 +290,7 @@ function Promise.cancel(self: Promise<any>)
 end
 
 -- Shorthand for :andThen(nil, onRejected)
-function Promise.catch(self: Promise<any>, onRejected: (...any) -> ()): Promise<any>
+function Promise.catch(self: Promise<any>, onRejected: (any) -> ()): Promise<any>
 	return self:andThen(nil, onRejected)
 end
 
@@ -369,21 +372,21 @@ function Promise.all<T>(promises: { Promise<T> }): Promise<{ T }>
 	local traceback = debug.traceback(nil, 2)
 
 	if typeof(promises) ~= "table" then
-		error(`Promies.all expects a table of promises, got: {typeof(promises)}`, 2)
+		error(`Promise.all expects a table of promises, got: {typeof(promises)}`, 2)
 	end
 
 	-- Edge case handling of an empty table being passed.
 	if #promises == 0 then
-		return Promise.resolve({})
+		return Promise.resolve({} :: {any})
 	end
 
-	return Promise.new(function(resolve, reject, onCancel)
-		local resolvedValues = {}
+	return Promise.new(function(resolve: ({ T }) -> (), reject, onCancel)
+		local resolvedValues: { T } = {}
 		local promisesRemaining = #promises
 
 		-- Cancellaion proagation
 		onCancel(function()
-			for _, promise in ipairs(promises) do
+			for _, promise in ipairs(promises :: { Promise<T> }) do
 				promise:cancel()
 			end
 		end)
@@ -410,12 +413,12 @@ function Promise.all<T>(promises: { Promise<T> }): Promise<{ T }>
 				end
 			end
 
-			promise:andThen(
+			(promise :: Promise<T>):andThen(
 				onFulfilled,
 				reject -- If any promise rejects, the entire .all() rejects immediately.
 			)
 		end
-	end)
+	end) :: Promise<{ T }>
 end
 
 --[[
@@ -430,11 +433,11 @@ function Promise.race<T>(promises: { Promise<T> }): Promise<T>
 		error(`Promise.race expects a table of promises, got: {typeof(promises)}`, 2)
 	end
 
-	return Promise.new(function(resolve, reject, onCancel)
+	return Promise.new(function(resolve: (T) -> (), reject, onCancel)
 		local isSettled = false
 
 		onCancel(function()
-			for _, promise in ipairs(promises) do
+			for _, promise in ipairs(promises :: { Promise<T> }) do
 				promise:cancel()
 			end
 		end)
@@ -463,9 +466,9 @@ function Promise.race<T>(promises: { Promise<T> }): Promise<T>
 				end
 			end
 
-			promise:andThen(onFulfilled, onRejected)
+			(promise :: Promise<T>):andThen(onFulfilled, onRejected)
 		end
-	end)
+	end) :: Promise<T>
 end
 
 return {
