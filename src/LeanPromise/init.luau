@@ -36,36 +36,29 @@ local PromiseError = require(script.PromiseError)
 type PromiseError = PromiseError.PromiseError
 
 type ClassType<T> = {
-    -- Private properties
-    _status: string,
-    _values: { any }?,
-    _valuesLength: number,
-    _unhandledRejection: boolean,
-    _parent: Promise<T>?,
-    _reason: any?,
-    _consumers: { [Promise<T>]: boolean },
-    _fulfilledCallbacks: { (T) -> () },
-    _rejectedCallbacks: { (any) -> () },
-    _cancellationHook: (() -> ())?,
-    -- Public Methods
-    andThen: (
-        self: Promise<T>,
-        onFulfilled: ((T) -> ...any)?,
-        onRejected: ((any) -> ...any)?
-    ) -> Promise<T>,
-    catch: (self: Promise<T>, onRejected: ((any) -> ())?) -> Promise<T>,
-    finally: (self: Promise<T>, onFinally: (() -> ())?) -> Promise<T>,
-    cancel: (self: Promise<T>) -> (),
-    all: (promises: { Promise<T> }) -> Promise<T>,
-    race: (promises: { Promise<T> }) -> Promise<T>,
-    -- Constructor
-    new: (
-        executor: (
-            resolve: (...any) -> (),
-            reject: (any) -> (),
-            onCancel: ((() -> ())?) -> boolean
-        ) -> ()
-    ) -> Promise<T>,
+	-- Private properties
+	_status: string,
+	_values: { any }?,
+	_valuesLength: number,
+	_unhandledRejection: boolean,
+	_parent: Promise<T>?,
+	_reason: any?,
+	_consumers: { [Promise<T>]: boolean },
+	_fulfilledCallbacks: { (T) -> () },
+	_rejectedCallbacks: { (any) -> () },
+	_cancellationHook: (() -> ())?,
+	-- Public Methods
+	andThen: (self: Promise<T>, onFulfilled: ((T) -> ...any)?, onRejected: ((any) -> ...any)?) -> Promise<T>,
+	catch: (self: Promise<T>, onRejected: ((any) -> ())?) -> Promise<T>,
+	finally: (self: Promise<T>, onFinally: (() -> ())?) -> Promise<T>,
+	cancel: (self: Promise<T>) -> (),
+	all: (promises: { Promise<T> }) -> Promise<T>,
+	race: (promises: { Promise<T> }) -> Promise<T>,
+	await: (self: Promise<T>) -> ...any,
+	-- Constructor
+	new: (
+		executor: (resolve: (T) -> (), reject: (any) -> (), onCancel: ((() -> ())?) -> boolean) -> ()
+	) -> Promise<T>,
 }
 
 -- An enum for the different states a Promise can be in.
@@ -377,7 +370,7 @@ function Promise.all<T>(promises: { Promise<T> }): Promise<{ T }>
 
 	-- Edge case handling of an empty table being passed.
 	if #promises == 0 then
-		return Promise.resolve({} :: {any})
+		return Promise.resolve({} :: { any })
 	end
 
 	return Promise.new(function(resolve: ({ T }) -> (), reject, onCancel)
@@ -471,10 +464,43 @@ function Promise.race<T>(promises: { Promise<T> }): Promise<T>
 	end) :: Promise<T>
 end
 
+--[[
+	Yields the current thread until the Promise is settled.
+	
+	@return The resolved values, or errors if the Promise was rejected.
+]]
+function Promise.await(self: Promise<any>): ...any
+	-- Awaiting counts as handling a rejection
+	self._unhandledRejection = false
+
+	if self._status == Status.Started then
+		local thread = coroutine.running()
+
+		-- Hook into the promise completion to resume this thread
+		self:finally(function()
+			task.spawn(thread)
+		end)
+
+		-- Yield execution until finally() calles task.spawn
+		coroutine.yield()
+	end
+
+	if self._status == Status.Resolved and self._values then
+		return unpack(self._values, 1, self._valuesLength)
+	elseif self._status == Status.Rejected then
+		-- Throw the rejection reason up the call stack
+		error(tostring(self._reason), 2)
+	end
+
+	-- Return nothing if Cancelled
+	return
+end
+
 return {
 	new = Promise.new,
 	all = Promise.all,
 	race = Promise.race,
 	resolve = Promise.resolve,
 	reject = Promise.reject,
+	await = Promise.await,
 }
