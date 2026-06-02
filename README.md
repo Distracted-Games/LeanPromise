@@ -13,6 +13,10 @@ The library is architected as a self-contained package:
 | `init.luau` | `.../LeanPromise/` | The main entry point and the `Promise` class constructor. This is what you `require`. |
 | `PromiseError.luau` | `.../LeanPromise/` | A rich error object used for Promise rejections, providing detailed debug info. |
 
+## 📦 How to Get
+
+Open the [Releases](https://github.com/Distracted-Games/LeanPromise/releases/) page on the right side of the screen and either download the Roblox Model containing the module or directly download the source code.
+
 ## 🧠 Design Philosophy
 
 This library was built on three core professional principles:
@@ -82,6 +86,7 @@ print("This message prints immediately, without waiting for the DataStore!")
 | `promise:catch(onRejected)` | Shorthand for handling only the failure case of a promise. |
 | `promise:finally(onFinally)` | Registers a function to run when the promise settles, regardless of success or failure. |
 | `promise:cancel()` | Cancels a promise if it is still pending. |
+| `promise:await()` | Yields the current thread until the promise is settled. |
 
 ### Static Utility Functions
 | Function | Description |
