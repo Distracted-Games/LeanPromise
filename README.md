@@ -15,7 +15,7 @@ The library is architected as a self-contained package:
 
 ## 📦 How to Get
 
-Open the [Releases](https://github.com/Distracted-Games/LeanPromise/releases/) page on the right side of the screen and either download the Roblox Model containing the module or directly download the source code.
+Open the [Releases](https://github.com/Distracted-Games/LeanPromise/releases/latest) page on the right side of the screen and either download the Roblox Model containing the module or directly download the source code.
 
 ## 🧠 Design Philosophy
 
