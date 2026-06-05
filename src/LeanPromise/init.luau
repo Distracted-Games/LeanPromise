@@ -54,6 +54,7 @@ type ClassType<T> = {
 	cancel: (self: Promise<T>) -> (),
 	all: (promises: { Promise<T> }) -> Promise<T>,
 	race: (promises: { Promise<T> }) -> Promise<T>,
+	delay: (seconds: number) -> Promise<T>,
 	await: (self: Promise<T>) -> ...any,
 	-- Constructor
 	new: (
@@ -465,6 +466,25 @@ function Promise.race<T>(promises: { Promise<T> }): Promise<T>
 end
 
 --[[
+    Returns a Promise that resolves after the specified number of seconds.
+    Hooks into the cancellation pipeline to physically cancel the scheduled task
+    if the Promise is cancelled before the delay finishes.
+]]
+function Promise.delay(seconds: number): Promise<number>
+	return Promise.new(function(resolve, _, onCancel)
+		-- Schedule the resolution and capture the running thread
+		local thread = task.delay(seconds, function()
+			resolve(seconds)
+		end)
+
+		-- If this Promise is cancelled, kill the scheduled task immediately
+		onCancel(function()
+			task.cancel(thread)
+		end)
+	end) :: Promise<number>
+end
+
+--[[
 	Yields the current thread until the Promise is settled.
 	
 	@return The resolved values, or errors if the Promise was rejected.
@@ -502,5 +522,6 @@ return {
 	race = Promise.race,
 	resolve = Promise.resolve,
 	reject = Promise.reject,
+	delay = Promise.delay,
 	await = Promise.await,
 }

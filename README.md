@@ -87,6 +87,7 @@ print("This message prints immediately, without waiting for the DataStore!")
 | `promise:finally(onFinally)` | Registers a function to run when the promise settles, regardless of success or failure. |
 | `promise:cancel()` | Cancels a promise if it is still pending. |
 | `promise:await()` | Yields the current thread until the promise is settled. |
+| `promise.delay()` | Returns a Promise that resolves after the specified number of seconds. |
 
 ### Static Utility Functions
 | Function | Description |
