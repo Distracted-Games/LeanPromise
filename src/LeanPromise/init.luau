@@ -251,7 +251,7 @@ function Promise.andThen(
 			-- If the current promise has already suceeded, schedule the success
 			-- callback to run on the next frame.
 			task.spawn(successCallback, unpack(self._values, 1, self._valuesLength))
-		elseif self._status == Status.Rejected and self._values then
+		elseif self._status == Status.Rejected then
 			-- If the current promise has already failed, schedule the failure callback.
 			task.spawn(failureCallback, unpack(self._values, 1, self._valuesLength))
 		end
@@ -311,7 +311,7 @@ function Promise.finally(self: Promise<any>, onFinally: (() -> ())?): Promise<an
 			local function passThroughOriginalOutcome()
 				if self._status == Status.Resolved and self._values then
 					resolve(unpack(self._values, 1, self._valuesLength))
-				elseif self._status == Status.Rejected and self._values then
+				elseif self._status == Status.Rejected then
 					reject(unpack(self._values, 1, self._valuesLength))
 				else
 					-- This could happen if the promise was cancelled or resolved with no values.
