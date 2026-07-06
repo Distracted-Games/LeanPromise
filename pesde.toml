@@ -1,0 +1,33 @@
+name = "distractedgames/lean_promise"
+version = "1.2.1"
+description = "LeanPromise is a complete, feature-complete refactor of the popular Promise.lua library by evaera, architected to align with modern Luau idioms and a professional, type-safe workflow."
+authors = ["Distracted Games"]
+repository = "https://github.com/Distracted-Games/LeanPromise"
+license = "MIT"
+
+includes = [
+    "pesde.toml",
+    "README.md",
+    "LICENSE",
+    "src/**/*.luau",
+]
+
+[target]
+environment = "roblox"
+lib = "src/LeanPromise/init.luau"
+build_files = ["src/LeanPromise"]
+
+[indices]
+default = "https://github.com/pesde-pkg/index"
+
+[scripts]
+roblox_sync_config_generator = ".pesde/scripts/roblox_sync_config_generator.luau"
+sourcemap_generator = ".pesde/scripts/sourcemap_generator.luau"
+
+[dev_dependencies]
+scripts = { name = "pesde/scripts_rojo", version = "^0.2.0", target = "lune" }
+rojo = { name = "pesde/rojo", version = "^7.5.1", target = "lune" }
+
+[engines]
+pesde = "^0.7.0"
+lune = "^0.10.2"
