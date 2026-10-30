@@ -8,7 +8,7 @@
 
 	---
 
-	Copyright (c) 2025 Distracted Games
+	Copyright (c) 2026 Distracted Games
 
 	Permission is hereby granted, free of charge, to any person obtaining a copy
 	of this software and associated documentation files (the "Software"), to deal
@@ -26,55 +26,28 @@
 	Designed to handle asynchronous operations like DataStore calls or asset loading
 	in a clean, non-blocking, and readable way.
 
-	LeanPromise is a complete, feature-complete refactor of the popular
-	Promise.lua library by evaera, architected to align with modern Luau
-	idioms and a professional, type-safe workflow.
+	LeanPromise is a refactored derivative of the Promise.lua library by evaera,
+	architected to align with modern Luau idioms and a strict, type-safe workflow.
 ]]
 
-local PromiseError = require(script.PromiseError)
+const PromiseError = require("@self/PromiseError")
 
 type PromiseError = PromiseError.PromiseError
 
-type ClassType<T> = {
-	-- Private properties
-	_status: string,
-	_values: { any }?,
-	_valuesLength: number,
-	_unhandledRejection: boolean,
-	_parent: Promise<T>?,
-	_reason: any?,
-	_consumers: { [Promise<T>]: boolean },
-	_fulfilledCallbacks: { (T) -> () },
-	_rejectedCallbacks: { (any) -> () },
-	_cancellationHook: (() -> ())?,
-	-- Public Methods
-	andThen: (self: Promise<T>, onFulfilled: ((T) -> ...any)?, onRejected: ((any) -> ...any)?) -> Promise<T>,
-	catch: (self: Promise<T>, onRejected: ((any) -> ())?) -> Promise<T>,
-	finally: (self: Promise<T>, onFinally: (() -> ())?) -> Promise<T>,
-	cancel: (self: Promise<T>) -> (),
-	all: (promises: { Promise<T> }) -> Promise<T>,
-	race: (promises: { Promise<T> }) -> Promise<T>,
-	delay: (seconds: number) -> Promise<T>,
-	await: (self: Promise<T>) -> ...any,
-	-- Constructor
-	new: (
-		executor: (resolve: (T) -> (), reject: (any) -> (), onCancel: ((() -> ())?) -> boolean) -> ()
-	) -> Promise<T>,
-}
+export type StatusType = "Started" | "Resolved" | "Rejected" | "Cancelled"
 
--- An enum for the different states a Promise can be in.
-local Status = {
+const Status = {
 	Started = "Started" :: "Started",
 	Resolved = "Resolved" :: "Resolved",
 	Rejected = "Rejected" :: "Rejected",
-	Cancelled = "Cancelled" :: "Cancelled", -- Note: we're omitting cancellation for this refactor to simplify
+	Cancelled = "Cancelled" :: "Cancelled",
 }
 table.freeze(Status)
 
 --[[
-    A more robust xpcall handler that creates our rich error object.
+	Creates an xpcall error handler that wraps raw errors in a rich PromiseError.
 ]]
-local function makeErrorHandler(traceback: string)
+local function makeErrorHandler(traceback: string): (err: any) -> PromiseError
 	return function(err: any): PromiseError
 		if PromiseError.is(err) then
 			return err
@@ -83,14 +56,13 @@ local function makeErrorHandler(traceback: string)
 			error = err,
 			kind = PromiseError.Kind.ExecutionError,
 			trace = debug.traceback(tostring(err), 2),
-			context = "Promise created at:\n" .. traceback,
+			context = `Promise created at:\n{traceback}`,
 		})
 	end
 end
 
 --[[
-    Safely calls a function and captures its return values or error.
-    We use xpcall to provide our custom error handling function.
+	Safely invokes a callback with xpcall and captures its return values or PromiseError.
 ]]
 local function runExecutor(traceback: string, callback: (...any) -> ...any, ...: any): (boolean, ...any)
 	return xpcall(callback, makeErrorHandler(traceback), ...)
@@ -99,22 +71,37 @@ end
 local Promise = {}
 Promise.__index = Promise
 
-export type Promise<T> = setmetatable<ClassType<T>, typeof(Promise)>
+type PromiseData<T> = {
+	_status: StatusType,
+	_values: { any }?,
+	_valuesLength: number,
+	_unhandledRejection: boolean,
+	_parent: any,
+	_reason: any,
+	_consumers: { [any]: boolean },
+	_fulfilledCallbacks: { (T) -> () },
+	_rejectedCallbacks: { (any) -> () },
+	_cancellationHook: (() -> ())?,
+}
 
-function Promise.new<T>(
-	executor: (
-		resolve: (...any) -> (),
-		reject: (any) -> (),
-		onCancel: ((() -> ())?) -> boolean
-	) -> ()
-): Promise<T>
-	-- Capturing stack trace at the moment of creation.
-	local traceback = debug.traceback(nil, 2)
+export type Promise<T = any> = setmetatable<PromiseData<T>, typeof(Promise)>
+
+function Promise.is(value: any): boolean
+	return typeof(value) == "table" and getmetatable(value) == Promise
+end
+
+function Promise.new<T>(executor: (
+	resolve: (...any) -> (),
+	reject: (any) -> (),
+	onCancel: (cancellationHook: (() -> ())?) -> boolean
+) -> ()): Promise<T>
+	const traceback = debug.traceback(nil, 2)
 
 	local self = setmetatable({}, Promise) :: Promise<T>
 	self._status = Status.Started
 	self._values = nil
 	self._valuesLength = -1
+	self._unhandledRejection = false
 	self._reason = nil
 	self._fulfilledCallbacks = {}
 	self._rejectedCallbacks = {}
@@ -122,23 +109,25 @@ function Promise.new<T>(
 	self._parent = nil
 	self._consumers = {}
 
-	local function resolve(...)
-		-- A promise can only be settled once. Ignore if not 'Started'.
+	local function resolve(...: any)
 		if self._status ~= Status.Started then
 			return
 		end
 
-		local n = select("#", ...)
+		const valueCount = select("#", ...)
 		self._status = Status.Resolved
 		self._values = { ... }
-		self._valuesLength = n
+		self._valuesLength = valueCount
+		self._cancellationHook = nil
 
-		-- We clear all callbacks after firing to free up memory.
-		for _, callback in ipairs(self._fulfilledCallbacks) do
-			task.spawn(callback, ...)
-		end
+		const callbacks = table.clone(self._fulfilledCallbacks)
 		table.clear(self._fulfilledCallbacks)
 		table.clear(self._rejectedCallbacks)
+		table.clear(self._consumers)
+
+		for _, callback in callbacks do
+			task.spawn(callback, ...)
+		end
 	end
 
 	local function reject(reason: any)
@@ -148,12 +137,17 @@ function Promise.new<T>(
 
 		self._status = Status.Rejected
 		self._reason = reason
+		self._unhandledRejection = true
+		self._cancellationHook = nil
 
-		for _, callback in ipairs(self._rejectedCallbacks) do
-			task.spawn(callback, reason)
-		end
+		const callbacks = table.clone(self._rejectedCallbacks)
 		table.clear(self._fulfilledCallbacks)
 		table.clear(self._rejectedCallbacks)
+		table.clear(self._consumers)
+
+		for _, callback in callbacks do
+			task.spawn(callback, reason)
+		end
 	end
 
 	local function onCancel(cancellationHook: (() -> ())?): boolean
@@ -169,12 +163,7 @@ function Promise.new<T>(
 	end
 
 	task.spawn(function()
-		local success, result = runExecutor(traceback, function()
-			executor(resolve, reject, onCancel)
-		end)
-
-		-- If the executer function itself errors (not an async rejection), we
-		-- must reject the promise.
+		const success, result = runExecutor(traceback, executor, resolve, reject, onCancel)
 		if not success then
 			reject(result)
 		end
@@ -184,86 +173,88 @@ function Promise.new<T>(
 end
 
 --[[
-    Helper function to safely execute a handler and pass the result to the next promise in the chain.
+	Safely executes a chained handler and forwards its settlement to the next Promise.
 ]]
-local function createChainedCallback<T>(
+local function createChainedCallback(
 	traceback: string,
-	handler: (...any) -> T | Promise<T>,
-	resolve: (T) -> (),
-	reject: (any) -> ()
+	handler: (...any) -> ...any,
+	resolve: (...any) -> (),
+	reject: (any) -> (),
+	cancelNext: () -> ()
 ): (...any) -> ()
-	return function(...)
-		-- Safely execute the user-provided success or failure handler.
-		local success, result = runExecutor(traceback, handler, ...)
-
-		if success then
-			-- If the handler returns another promise, we must wait for it to settle
-			-- before resolving the current link in tha chain.
-			if typeof(result) == "table" and getmetatable(result) == Promise then
-				(result :: Promise<T>):andThen(resolve, reject)
-			else
-				-- Otherwise, just resolve with the returned value.
-				resolve(result)
-			end
-		else
-			-- If the handler itself errors, reject the next promise in the chain.
+	return function(...: any)
+		const success, result = runExecutor(traceback, handler, ...)
+		if not success then
 			reject(result)
+			return
+		end
+
+		if Promise.is(result) then
+			const chainedPromise = result :: Promise<any>
+			if chainedPromise._status == Status.Cancelled then
+				cancelNext()
+				return
+			end
+			chainedPromise:andThen(resolve, reject)
+		else
+			resolve(result)
 		end
 	end
 end
 
-function Promise.andThen(
-	self: Promise<any>,
-	onFulfilled: ((...any) -> any?)?,
-	onRejected: ((any) -> any?)?
-): Promise<any>
+function Promise.getStatus<T>(self: Promise<T>): StatusType
+	return self._status
+end
+
+function Promise.andThen<T>(self: Promise<T>, onFulfilled: ((T) -> ...any)?, onRejected: ((any) -> ...any)?): Promise<any>
 	if self._status == Status.Cancelled then
-		local p = Promise.new(function() end)
-		p:cancel()
-		return p
+		local cancelledPromise = Promise.new(function() end)
+		cancelledPromise:cancel()
+		return cancelledPromise
 	end
 
-	-- Mark this promise as "handled" to revent unhandled rejection warnings.
 	if onRejected then
 		self._unhandledRejection = false
 	end
 
-	-- Cature the traceback for creating the next link in the chain.
-	local traceback = debug.traceback(nil, 2)
+	const traceback = debug.traceback(nil, 2)
+	local nextPromise: Promise<any>
 
-	-- Create the next promise in the chain. It starts in a "Started" state.
-	-- This new promise will only settle when our current promise ('self') settles.
-	local nextPromise = Promise.new(function(resolve, reject)
-		local successCallback = if onFulfilled
-			then createChainedCallback(traceback, onFulfilled, resolve, reject)
+	nextPromise = Promise.new(function(resolve, reject)
+		const cancelNext = function()
+			if nextPromise then
+				nextPromise:cancel()
+			end
+		end
+
+		const successCallback = if onFulfilled
+			then createChainedCallback(traceback, onFulfilled :: any, resolve, reject, cancelNext)
 			else resolve
 
-		local failureCallback = if onRejected
-			then createChainedCallback(traceback, onRejected, resolve, reject)
+		const failureCallback = if onRejected
+			then createChainedCallback(traceback, onRejected, resolve, reject, cancelNext)
 			else reject
 
 		if self._status == Status.Started then
-			-- If the current promise is still running, queue these callbacks.
-			-- They will be executed later when 'self' resolved or rejects.
 			table.insert(self._fulfilledCallbacks, successCallback)
 			table.insert(self._rejectedCallbacks, failureCallback)
-		elseif self._status == Status.Resolved and self._values then
-			-- If the current promise has already suceeded, schedule the success
-			-- callback to run on the next frame.
-			task.spawn(successCallback, unpack(self._values, 1, self._valuesLength))
+		elseif self._status == Status.Resolved then
+			const values = self._values or {}
+			task.spawn(successCallback, table.unpack(values, 1, self._valuesLength))
 		elseif self._status == Status.Rejected then
-			-- If the current promise has already failed, schedule the failure callback.
-			task.spawn(failureCallback, unpack(self._values, 1, self._valuesLength))
+			task.spawn(failureCallback, self._reason)
 		end
 	end)
 
-	nextPromise._parent = self
-	self._consumers[nextPromise] = true
+	if self._status == Status.Started and nextPromise._status == Status.Started then
+		nextPromise._parent = self
+		self._consumers[nextPromise] = true
+	end
 
 	return nextPromise
 end
 
-function Promise.cancel(self: Promise<any>)
+function Promise.cancel<T>(self: Promise<T>)
 	if self._status ~= Status.Started then
 		return
 	end
@@ -271,86 +262,112 @@ function Promise.cancel(self: Promise<any>)
 	self._status = Status.Cancelled
 
 	if self._cancellationHook then
-		task.spawn(self._cancellationHook)
+		const hook = self._cancellationHook
+		self._cancellationHook = nil
+		task.spawn(hook)
 	end
 
-	-- Propagate cancellation DOWN the chain to consumers
-	for consumer, _ in self._consumers do
-		(consumer :: Promise<any>):cancel()
+	const parent = self._parent
+	if parent then
+		parent._consumers[self] = nil
+		self._parent = nil
+		if next(parent._consumers) == nil then
+			parent:cancel()
+		end
+	end
+
+	local consumersToCancel: { Promise<any> } = {}
+	for consumer in self._consumers do
+		table.insert(consumersToCancel, consumer)
+	end
+	table.clear(self._consumers)
+
+	for _, consumer in consumersToCancel do
+		consumer._parent = nil
+		consumer:cancel()
 	end
 
 	table.clear(self._fulfilledCallbacks)
 	table.clear(self._rejectedCallbacks)
 end
 
--- Shorthand for :andThen(nil, onRejected)
-function Promise.catch(self: Promise<any>, onRejected: (any) -> ()): Promise<any>
+function Promise.catch<T>(self: Promise<T>, onRejected: (any) -> ...any): Promise<any>
 	return self:andThen(nil, onRejected)
 end
 
-function Promise.finally(self: Promise<any>, onFinally: (() -> ())?): Promise<any>
+function Promise.finally<T>(self: Promise<T>, onFinally: (() -> ...any)?): Promise<T>
 	if not onFinally then
-		return self -- If no handler, just return the original promise
+		return self
 	end
 
-	self._unhandledRejection = false -- A `:finally` counts as handling a rejection.
-	local traceback = debug.traceback(nil, 2)
+	self._unhandledRejection = false
+	const traceback = debug.traceback(nil, 2)
 
-	return Promise.new(function(resolve: (...any) -> (), reject: (any) -> ())
-		-- This callback runs regardless of the outcome of 'self'.
+	if self._status == Status.Cancelled then
+		task.spawn(runExecutor, traceback, onFinally)
+		local cancelledPromise = Promise.new(function() end) :: Promise<T>
+		cancelledPromise:cancel()
+		return cancelledPromise
+	end
+
+	local finallyPromise: Promise<T>
+	finallyPromise = Promise.new(function(resolve, reject, onCancel)
+		onCancel(function()
+			task.spawn(runExecutor, traceback, onFinally)
+		end)
+
 		local function finallyCallback()
-			local success, result = runExecutor(traceback, onFinally)
-
+			const success, result = runExecutor(traceback, onFinally)
 			if not success then
-				-- If the finally handler itself errors, the entire chain must reject.
 				reject(result)
 				return
 			end
 
-			-- Helper function to forward the original promise's settlement.
 			local function passThroughOriginalOutcome()
-				if self._status == Status.Resolved and self._values then
-					resolve(unpack(self._values, 1, self._valuesLength))
+				if self._status == Status.Resolved then
+					const values = self._values or {}
+					resolve(table.unpack(values, 1, self._valuesLength))
 				elseif self._status == Status.Rejected then
-					reject(unpack(self._values, 1, self._valuesLength))
-				else
-					-- This could happen if the promise was cancelled or resolved with no values.
-					-- We resolve with no value to signal the chain can continue.
-					resolve()
+					reject(self._reason)
 				end
 			end
 
-			-- If the finally handler returnss a promise, wait for it.
-			if typeof(result) == "table" and getmetatable(result) == Promise then
-				(result :: Promise<any>):andThen(
-					passThroughOriginalOutcome,
-					reject -- If the returned promise rejects, the whole chain rejects.
-				)
+			if Promise.is(result) then
+				const returnedPromise = result :: Promise<any>
+				if returnedPromise._status == Status.Cancelled then
+					if finallyPromise then
+						finallyPromise:cancel()
+					end
+					return
+				end
+				returnedPromise:andThen(passThroughOriginalOutcome, reject)
 			else
-				-- If the handler was a simple function, we can immediately pass the original outcome.
 				passThroughOriginalOutcome()
 			end
 		end
 
-		-- Hook into the original promise's settlement.
 		if self._status == Status.Started then
-			table.insert(self._fulfilledCallbacks, finallyCallback)
-			table.insert(self._rejectedCallbacks, finallyCallback)
+			table.insert(self._fulfilledCallbacks, finallyCallback :: any)
+			table.insert(self._rejectedCallbacks, finallyCallback :: any)
 		else
-			-- Already settled, run immediately.
 			task.spawn(finallyCallback)
 		end
-	end)
+	end) :: Promise<T>
+
+	if self._status == Status.Started and finallyPromise._status == Status.Started then
+		finallyPromise._parent = self
+		self._consumers[finallyPromise] = true
+	end
+
+	return finallyPromise
 end
 
--- Helper function to create an already-resolved promise
 function Promise.resolve<T>(value: T): Promise<T>
 	return Promise.new(function(resolve)
 		resolve(value)
 	end)
 end
 
--- Helper function to create an already-rejected promise
 function Promise.reject(reason: any): Promise<any>
 	return Promise.new(function(_, reject)
 		reject(reason)
@@ -358,170 +375,130 @@ function Promise.reject(reason: any): Promise<any>
 end
 
 --[[
-    Accepts an array of Promises and returns a new promise that:
-    - Resolves with a table of all resolved values after all input promises resolve.
-    - Rejects is ANY input promise rejects.
+	Accepts an array of Promises and returns a new Promise that:
+	- Resolves with an array of all resolved values once every input Promise resolves.
+	- Rejects immediately if any input Promise rejects.
 ]]
 function Promise.all<T>(promises: { Promise<T> }): Promise<{ T }>
-	local traceback = debug.traceback(nil, 2)
+	const traceback = debug.traceback(nil, 2)
 
 	if typeof(promises) ~= "table" then
 		error(`Promise.all expects a table of promises, got: {typeof(promises)}`, 2)
 	end
 
-	-- Edge case handling of an empty table being passed.
 	if #promises == 0 then
-		return Promise.resolve({} :: { any })
+		return Promise.resolve({} :: { T })
 	end
 
-	return Promise.new(function(resolve: ({ T }) -> (), reject, onCancel)
+	return Promise.new(function(resolve, reject, onCancel)
 		local resolvedValues: { T } = {}
 		local promisesRemaining = #promises
+		local isSettled = false
 
-		-- Cancellaion proagation
 		onCancel(function()
-			for _, promise in ipairs(promises :: { Promise<T> }) do
-				promise:cancel()
+			for _, promise in promises do
+				if Promise.is(promise) then
+					promise:cancel()
+				end
 			end
 		end)
 
-		for index, promise in ipairs(promises) do
-			-- Ensure all inputs are valid promises
-			if typeof(promise) ~= "table" or getmetatable(promise) ~= Promise then
-				-- We reject the main promise, not error, to keep behavior async
+		for index, promise in promises do
+			if not Promise.is(promise) then
+				isSettled = true
 				reject(PromiseError.new({
-					error = `Value at index {index} is not a promise.`,
+					error = `Value at index {index} is not a Promise.`,
 					kind = PromiseError.Kind.ExecutionError,
 					trace = traceback,
 				}))
 				return
 			end
 
-			local function onFulfilled(value)
+			local function onFulfilled(value: T)
+				if isSettled then
+					return
+				end
 				resolvedValues[index] = value
 				promisesRemaining -= 1
 
-				-- If this was the last promise to resolve, resolve the main promise
 				if promisesRemaining <= 0 then
+					isSettled = true
 					resolve(resolvedValues)
 				end
 			end
 
-			(promise :: Promise<T>):andThen(
-				onFulfilled,
-				reject -- If any promise rejects, the entire .all() rejects immediately.
-			)
+			local function onRejected(err: any)
+				if isSettled then
+					return
+				end
+				isSettled = true
+				reject(err)
+			end
+
+			promise:andThen(onFulfilled, onRejected)
 		end
 	end) :: Promise<{ T }>
 end
 
 --[[
-    Accepts an array of Promises and returns a new promise that:
-    - Resolves as soon as the FIRST input promise resolves.
-    - Rejects as soon as the FIRST input promise rejects.
+	Accepts an array of Promises and returns a new Promise that settles as soon as
+	the first input Promise resolves or rejects.
 ]]
 function Promise.race<T>(promises: { Promise<T> }): Promise<T>
-	local traceback = debug.traceback(nil, 2)
+	const traceback = debug.traceback(nil, 2)
 
 	if typeof(promises) ~= "table" then
 		error(`Promise.race expects a table of promises, got: {typeof(promises)}`, 2)
 	end
 
-	return Promise.new(function(resolve: (T) -> (), reject, onCancel)
+	return Promise.new(function(resolve, reject, onCancel)
 		local isSettled = false
 
 		onCancel(function()
-			for _, promise in ipairs(promises :: { Promise<T> }) do
-				promise:cancel()
+			for _, promise in promises do
+				if Promise.is(promise) then
+					promise:cancel()
+				end
 			end
 		end)
 
-		for index, promise in ipairs(promises) do
-			if typeof(promise) ~= "table" or getmetatable(promise) ~= Promise then
+		for index, promise in promises do
+			if not Promise.is(promise) then
+				isSettled = true
 				reject(PromiseError.new({
-					error = `Value at index {index} is not a promise.`,
+					error = `Value at index {index} is not a Promise.`,
 					kind = PromiseError.Kind.ExecutionError,
 					trace = traceback,
 				}))
 				return
 			end
 
-			local function onFulfilled(value)
+			local function onFulfilled(value: T)
 				if not isSettled then
 					isSettled = true
 					resolve(value)
 				end
 			end
 
-			local function onRejected(err)
+			local function onRejected(err: any)
 				if not isSettled then
 					isSettled = true
 					reject(err)
 				end
 			end
 
-			(promise :: Promise<T>):andThen(onFulfilled, onRejected)
+			promise:andThen(onFulfilled, onRejected)
 		end
 	end) :: Promise<T>
 end
 
---[[
-    Returns a Promise that resolves after the specified number of seconds.
-    Hooks into the cancellation pipeline to physically cancel the scheduled task
-    if the Promise is cancelled before the delay finishes.
-]]
-function Promise.delay(seconds: number): Promise<number>
-	return Promise.new(function(resolve, _, onCancel)
-		-- Schedule the resolution and capture the running thread
-		local thread = task.delay(seconds, function()
-			resolve(seconds)
-		end)
-
-		-- If this Promise is cancelled, kill the scheduled task immediately
-		onCancel(function()
-			task.cancel(thread)
-		end)
-	end) :: Promise<number>
-end
-
---[[
-	Yields the current thread until the Promise is settled.
-	
-	@return The resolved values, or errors if the Promise was rejected.
-]]
-function Promise.await(self: Promise<any>): ...any
-	-- Awaiting counts as handling a rejection
-	self._unhandledRejection = false
-
-	if self._status == Status.Started then
-		local thread = coroutine.running()
-
-		-- Hook into the promise completion to resume this thread
-		self:finally(function()
-			task.spawn(thread)
-		end)
-
-		-- Yield execution until finally() calles task.spawn
-		coroutine.yield()
-	end
-
-	if self._status == Status.Resolved and self._values then
-		return unpack(self._values, 1, self._valuesLength)
-	elseif self._status == Status.Rejected then
-		-- Throw the rejection reason up the call stack
-		error(tostring(self._reason), 2)
-	end
-
-	-- Return nothing if Cancelled
-	return
-end
-
-return {
+return table.freeze({
+	Status = Status,
+	Error = PromiseError,
+	is = Promise.is,
 	new = Promise.new,
 	all = Promise.all,
 	race = Promise.race,
 	resolve = Promise.resolve,
 	reject = Promise.reject,
-	delay = Promise.delay,
-	await = Promise.await,
-}
+})
