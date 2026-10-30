@@ -1,29 +1,33 @@
 --!strict
-local TestSuite = require(script.Parent["LeanPromise.test"])
+const TestSuite = require("./LeanPromise.test")
+
+local testNames: { string } = {}
+for testName, testFn in TestSuite :: { [string]: any } do
+	if typeof(testFn) == "function" then
+		table.insert(testNames, testName)
+	end
+end
+table.sort(testNames)
 
 local totalTests = 0
 local passedTests = 0
 
 print("=====================================")
-print("  Running tests for Promise Library  ")
+print("  Running tests for LeanPromise      ")
 print("=====================================")
 
-for testName, testFunction in TestSuite :: { () -> () } do
+for _, testName in testNames do
 	totalTests += 1
-	local success, err = pcall(function()
-        return testFunction
-	end)
+	const testFunction = (TestSuite :: { [string]: () -> () })[testName]
+	const success, err = pcall(testFunction)
 
 	if success then
 		passedTests += 1
 		print(`  [PASS] {testName}`)
 	else
-		print(`  [FAIL] {testName} - {tostring(err)}`)
+		warn(`  [FAIL] {testName} - {tostring(err)}`)
 	end
 end
-
--- A small delay to allow any final async operations in tests to complete before the summary.
-task.wait(1)
 
 print("=====================================")
 print(`  Test Summary: {passedTests}/{totalTests} passed.  `)
