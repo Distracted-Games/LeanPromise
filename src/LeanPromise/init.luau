@@ -32,24 +32,26 @@
 
 const PromiseError = require("@self/PromiseError")
 
-type PromiseError = PromiseError.PromiseError
-
+export type PromiseError = PromiseError.PromiseError
 export type StatusType = "Started" | "Resolved" | "Rejected" | "Cancelled"
 
-const Status = {
+const Status = table.freeze({
 	Started = "Started" :: "Started",
 	Resolved = "Resolved" :: "Resolved",
 	Rejected = "Rejected" :: "Rejected",
 	Cancelled = "Cancelled" :: "Cancelled",
-}
-table.freeze(Status)
+})
 
 --[[
-	Creates an xpcall error handler that wraps raw errors in a rich PromiseError.
+	Creates an xpcall error handler that preserves PromiseError instances and custom
+	non-string error objects while wrapping string/nil errors in a rich PromiseError.
 ]]
-local function makeErrorHandler(traceback: string): (err: any) -> PromiseError
-	return function(err: any): PromiseError
+local function makeErrorHandler(traceback: string): (err: any) -> any
+	return function(err: any): any
 		if PromiseError.is(err) then
+			return err
+		end
+		if err ~= nil and typeof(err) ~= "string" then
 			return err
 		end
 		return PromiseError.new({
@@ -62,14 +64,42 @@ local function makeErrorHandler(traceback: string): (err: any) -> PromiseError
 end
 
 --[[
-	Safely invokes a callback with xpcall and captures its return values or PromiseError.
+	Safely invokes a callback with xpcall and captures its return values or error reason.
 ]]
 local function runExecutor(traceback: string, callback: (...any) -> ...any, ...: any): (boolean, ...any)
 	return xpcall(callback, makeErrorHandler(traceback), ...)
 end
 
-local Promise = {}
-Promise.__index = Promise
+type PrototypeMetatable = {
+	__index: any,
+}
+
+type AnyPromiseData = {
+	_status: StatusType,
+	_values: { any }?,
+	_valuesLength: number,
+	_unhandledRejection: boolean,
+	_parent: any,
+	_reason: any,
+	_consumers: { [any]: boolean },
+	_fulfilledCallbacks: { (...any) -> () },
+	_rejectedCallbacks: { (any) -> () },
+	_cancellationHook: (() -> ())?,
+	_thread: thread?,
+	_source: string,
+	read andThen: (
+		self: AnyPromise,
+		onFulfilled: ((value: any) -> ...any)?,
+		onRejected: ((reason: any) -> ...any)?
+	) -> AnyPromise,
+	read catch: (self: AnyPromise, onRejected: (reason: any) -> ...any) -> AnyPromise,
+	read finally: (self: AnyPromise, onFinally: ((status: StatusType) -> ...any)?) -> AnyPromise,
+	read cancel: (self: AnyPromise) -> (),
+	read getStatus: (self: AnyPromise) -> StatusType,
+	read await: (self: AnyPromise) -> any,
+}
+
+export type AnyPromise = setmetatable<AnyPromiseData, PrototypeMetatable>
 
 type PromiseData<T> = {
 	_status: StatusType,
@@ -79,25 +109,179 @@ type PromiseData<T> = {
 	_parent: any,
 	_reason: any,
 	_consumers: { [any]: boolean },
-	_fulfilledCallbacks: { (T) -> () },
+	_fulfilledCallbacks: { (...any) -> () },
 	_rejectedCallbacks: { (any) -> () },
 	_cancellationHook: (() -> ())?,
+	_thread: thread?,
+	_source: string,
+	read andThen: (
+		self: Promise<T>,
+		onFulfilled: ((value: T) -> ...any)?,
+		onRejected: ((reason: any) -> ...any)?
+	) -> AnyPromise,
+	read catch: (self: Promise<T>, onRejected: (reason: any) -> ...any) -> AnyPromise,
+	read finally: (self: Promise<T>, onFinally: ((status: StatusType) -> ...any)?) -> Promise<T>,
+	read cancel: (self: Promise<T>) -> (),
+	read getStatus: (self: Promise<T>) -> StatusType,
+	read await: (self: Promise<T>) -> T,
 }
 
-export type Promise<T = any> = setmetatable<PromiseData<T>, typeof(Promise)>
+export type Promise<T = any> = setmetatable<PromiseData<T>, PrototypeMetatable>
 
-function Promise.is(value: any): boolean
-	return typeof(value) == "table" and getmetatable(value) == Promise
-end
-
-function Promise.new<T>(executor: (
+type InternalExecutor = (
 	resolve: (...any) -> (),
 	reject: (any) -> (),
 	onCancel: (cancellationHook: (() -> ())?) -> boolean
-) -> ()): Promise<T>
-	const traceback = debug.traceback(nil, 2)
+) -> ()
 
-	local self = setmetatable({}, Promise) :: Promise<T>
+local PromisePrototype: { [string]: any } = {}
+PromisePrototype.__index = PromisePrototype
+
+local Promise = {}
+
+function Promise.is(value: any): boolean
+	return typeof(value) == "table" and getmetatable(value) == PromisePrototype
+end
+
+local function finalizePromise(self: AnyPromise)
+	const currentParent = self._parent
+	if currentParent then
+		currentParent._consumers[self] = nil
+		self._parent = nil
+	end
+
+	table.clear(self._fulfilledCallbacks)
+	table.clear(self._rejectedCallbacks)
+	table.clear(self._consumers)
+	self._cancellationHook = nil
+	self._thread = nil
+end
+
+local function scheduleUnhandledRejectionCheck(self: AnyPromise)
+	self._unhandledRejection = true
+	task.defer(function()
+		if self._unhandledRejection then
+			warn(`Unhandled Promise rejection:\n\n{tostring(self._reason)}\n\n{self._source}`)
+		end
+	end)
+end
+
+local rejectPromise: (self: AnyPromise, reason: any) -> ()
+
+local function resolvePromise(self: AnyPromise, ...: any)
+	if self._status ~= Status.Started then
+		return
+	end
+
+	if Promise.is((...)) then
+		if select("#", ...) > 1 then
+			warn(
+				`Promise resolved with multiple values where the first is a Promise; extra values ignored.\n{self._source}`
+			)
+		end
+
+		const chainedPromise = (...) :: AnyPromise
+		if chainedPromise == self then
+			rejectPromise(
+				self,
+				PromiseError.new({
+					error = "TypeError: A Promise cannot be resolved with itself.",
+					kind = PromiseError.Kind.ExecutionError,
+					context = `Promise created at:\n{self._source}`,
+				})
+			)
+			return
+		end
+
+		if chainedPromise._status == Status.Cancelled then
+			self:cancel()
+			return
+		elseif chainedPromise._status == Status.Resolved then
+			const values = chainedPromise._values or {}
+			resolvePromise(self, table.unpack(values, 1, chainedPromise._valuesLength))
+			return
+		elseif chainedPromise._status == Status.Rejected then
+			rejectPromise(self, chainedPromise._reason)
+			return
+		end
+
+		-- Adopt the pending inner Promise as our active parent for bidirectional cancellation.
+		const previousParent = self._parent
+		if previousParent then
+			previousParent._consumers[self] = nil
+		end
+		self._parent = chainedPromise
+		chainedPromise._consumers[self] = true
+
+		local function onAdoptedFulfilled(...: any)
+			resolvePromise(self, ...)
+		end
+
+		local function onAdoptedRejected(reason: any)
+			rejectPromise(self, reason)
+		end
+
+		table.insert(chainedPromise._fulfilledCallbacks, onAdoptedFulfilled)
+		table.insert(chainedPromise._rejectedCallbacks, onAdoptedRejected)
+
+		self._cancellationHook = function()
+			if chainedPromise._status ~= Status.Started then
+				return
+			end
+			const fulfilledIndex = table.find(chainedPromise._fulfilledCallbacks, onAdoptedFulfilled)
+			if fulfilledIndex then
+				table.remove(chainedPromise._fulfilledCallbacks, fulfilledIndex)
+			end
+			const rejectedIndex = table.find(chainedPromise._rejectedCallbacks, onAdoptedRejected)
+			if rejectedIndex then
+				table.remove(chainedPromise._rejectedCallbacks, rejectedIndex)
+			end
+		end
+
+		return
+	end
+
+	self._status = Status.Resolved
+	self._valuesLength = select("#", ...)
+	self._values = { ... }
+
+	const callbacks = self._fulfilledCallbacks
+	self._fulfilledCallbacks = {}
+	finalizePromise(self)
+
+	for _, callback in callbacks do
+		task.spawn(callback, ...)
+	end
+end
+
+rejectPromise = function(self: AnyPromise, reason: any)
+	if self._status ~= Status.Started then
+		return
+	end
+
+	self._status = Status.Rejected
+	self._reason = reason
+
+	const callbacks = self._rejectedCallbacks
+	self._rejectedCallbacks = {}
+	const hadListeners = #callbacks > 0
+	finalizePromise(self)
+
+	if not hadListeners then
+		scheduleUnhandledRejectionCheck(self)
+	end
+
+	for _, callback in callbacks do
+		task.spawn(callback, reason)
+	end
+end
+
+local function createInternalPromise(traceback: string, executor: InternalExecutor?, parent: AnyPromise?): any
+	if parent ~= nil and not Promise.is(parent) then
+		error("Argument #3 to createInternalPromise must be a Promise or nil", 2)
+	end
+
+	local self = (setmetatable({}, PromisePrototype) :: any) :: AnyPromise
 	self._status = Status.Started
 	self._values = nil
 	self._valuesLength = -1
@@ -108,46 +292,24 @@ function Promise.new<T>(executor: (
 	self._cancellationHook = nil
 	self._parent = nil
 	self._consumers = {}
+	self._thread = nil
+	self._source = traceback
+
+	if parent and parent._status == Status.Started then
+		self._parent = parent
+		parent._consumers[self] = true
+	end
+
+	if not executor then
+		return self
+	end
 
 	local function resolve(...: any)
-		if self._status ~= Status.Started then
-			return
-		end
-
-		const valueCount = select("#", ...)
-		self._status = Status.Resolved
-		self._values = { ... }
-		self._valuesLength = valueCount
-		self._cancellationHook = nil
-
-		const callbacks = table.clone(self._fulfilledCallbacks)
-		table.clear(self._fulfilledCallbacks)
-		table.clear(self._rejectedCallbacks)
-		table.clear(self._consumers)
-
-		for _, callback in callbacks do
-			task.spawn(callback, ...)
-		end
+		resolvePromise(self, ...)
 	end
 
 	local function reject(reason: any)
-		if self._status ~= Status.Started then
-			return
-		end
-
-		self._status = Status.Rejected
-		self._reason = reason
-		self._unhandledRejection = true
-		self._cancellationHook = nil
-
-		const callbacks = table.clone(self._rejectedCallbacks)
-		table.clear(self._fulfilledCallbacks)
-		table.clear(self._rejectedCallbacks)
-		table.clear(self._consumers)
-
-		for _, callback in callbacks do
-			task.spawn(callback, reason)
-		end
+		rejectPromise(self, reason)
 	end
 
 	local function onCancel(cancellationHook: (() -> ())?): boolean
@@ -162,99 +324,112 @@ function Promise.new<T>(executor: (
 		return self._status == Status.Cancelled
 	end
 
-	task.spawn(function()
-		const success, result = runExecutor(traceback, executor, resolve, reject, onCancel)
+	self._thread = task.spawn(function()
+		const success, err = runExecutor(traceback, executor, resolve, reject, onCancel)
+		if self._status == Status.Started then
+			self._thread = nil
+		end
 		if not success then
-			reject(result)
+			rejectPromise(self, err)
 		end
 	end)
 
 	return self
 end
 
---[[
-	Safely executes a chained handler and forwards its settlement to the next Promise.
-]]
-local function createChainedCallback(
-	traceback: string,
-	handler: (...any) -> ...any,
-	resolve: (...any) -> (),
-	reject: (any) -> (),
-	cancelNext: () -> ()
-): (...any) -> ()
-	return function(...: any)
-		const success, result = runExecutor(traceback, handler, ...)
-		if not success then
-			reject(result)
-			return
-		end
-
-		if Promise.is(result) then
-			const chainedPromise = result :: Promise<any>
-			if chainedPromise._status == Status.Cancelled then
-				cancelNext()
-				return
-			end
-			chainedPromise:andThen(resolve, reject)
-		else
-			resolve(result)
-		end
-	end
-end
-
-function Promise.getStatus<T>(self: Promise<T>): StatusType
-	return self._status
-end
-
-function Promise.andThen<T>(self: Promise<T>, onFulfilled: ((T) -> ...any)?, onRejected: ((any) -> ...any)?): Promise<any>
-	if self._status == Status.Cancelled then
-		local cancelledPromise = Promise.new(function() end)
-		cancelledPromise:cancel()
-		return cancelledPromise
-	end
-
-	if onRejected then
-		self._unhandledRejection = false
+function Promise.new<T>(executor: (
+	resolve: ((value: T) -> ()) & ((...any) -> ()),
+	reject: (reason: any) -> (),
+	onCancel: (cancellationHook: (() -> ())?) -> boolean
+) -> ()): Promise<T>
+	if typeof(executor) ~= "function" then
+		error(`Promise.new expects a function executor, got: {typeof(executor)}`, 2)
 	end
 
 	const traceback = debug.traceback(nil, 2)
-	local nextPromise: Promise<any>
+	return createInternalPromise(traceback, executor :: InternalExecutor, nil)
+end
 
-	nextPromise = Promise.new(function(resolve, reject)
-		const cancelNext = function()
-			if nextPromise then
-				nextPromise:cancel()
+function PromisePrototype.getStatus(self: AnyPromise): StatusType
+	return self._status
+end
+
+function PromisePrototype.andThen(
+	self: AnyPromise,
+	onFulfilled: ((value: any) -> ...any)?,
+	onRejected: ((reason: any) -> ...any)?
+): AnyPromise
+	if onFulfilled ~= nil and typeof(onFulfilled) ~= "function" then
+		error(`Promise:andThen expects a function for onFulfilled, got: {typeof(onFulfilled)}`, 2)
+	end
+	if onRejected ~= nil and typeof(onRejected) ~= "function" then
+		error(`Promise:andThen expects a function for onRejected, got: {typeof(onRejected)}`, 2)
+	end
+
+	const traceback = debug.traceback(nil, 2)
+	self._unhandledRejection = false
+
+	if self._status == Status.Cancelled then
+		const cancelled = createInternalPromise(traceback, nil, nil)
+		cancelled:cancel()
+		return cancelled
+	end
+
+	return createInternalPromise(traceback, function(resolve, reject, onCancel)
+		local function invokeHandler(handler: (...any) -> ...any, ...: any)
+			const results = table.pack(runExecutor(traceback, handler, ...))
+			if not results[1] then
+				reject(results[2])
+				return
+			end
+			resolve(table.unpack(results, 2, results.n))
+		end
+
+		local successCallback: (...any) -> () = resolve
+		if onFulfilled then
+			const handler = onFulfilled
+			successCallback = function(...: any)
+				invokeHandler(handler, ...)
 			end
 		end
 
-		const successCallback = if onFulfilled
-			then createChainedCallback(traceback, onFulfilled :: any, resolve, reject, cancelNext)
-			else resolve
-
-		const failureCallback = if onRejected
-			then createChainedCallback(traceback, onRejected, resolve, reject, cancelNext)
-			else reject
+		local failureCallback: (any) -> () = reject
+		if onRejected then
+			const handler = onRejected
+			failureCallback = function(reason: any)
+				invokeHandler(handler, reason)
+			end
+		end
 
 		if self._status == Status.Started then
 			table.insert(self._fulfilledCallbacks, successCallback)
 			table.insert(self._rejectedCallbacks, failureCallback)
+
+			onCancel(function()
+				if self._status ~= Status.Started then
+					return
+				end
+
+				const fulfilledIndex = table.find(self._fulfilledCallbacks, successCallback)
+				if fulfilledIndex then
+					table.remove(self._fulfilledCallbacks, fulfilledIndex)
+				end
+
+				const rejectedIndex = table.find(self._rejectedCallbacks, failureCallback)
+				if rejectedIndex then
+					table.remove(self._rejectedCallbacks, rejectedIndex)
+				end
+			end)
 		elseif self._status == Status.Resolved then
 			const values = self._values or {}
-			task.spawn(successCallback, table.unpack(values, 1, self._valuesLength))
+			successCallback(table.unpack(values, 1, self._valuesLength))
 		elseif self._status == Status.Rejected then
-			task.spawn(failureCallback, self._reason)
+			failureCallback(self._reason)
 		end
-	end)
-
-	if self._status == Status.Started and nextPromise._status == Status.Started then
-		nextPromise._parent = self
-		self._consumers[nextPromise] = true
-	end
-
-	return nextPromise
+	end, self)
 end
 
-function Promise.cancel<T>(self: Promise<T>)
+function PromisePrototype.cancel(self: AnyPromise)
 	if self._status ~= Status.Started then
 		return
 	end
@@ -267,6 +442,12 @@ function Promise.cancel<T>(self: Promise<T>)
 		task.spawn(hook)
 	end
 
+	const executorThread = self._thread
+	self._thread = nil
+	if executorThread and executorThread ~= coroutine.running() and coroutine.status(executorThread) == "suspended" then
+		pcall(task.cancel, executorThread)
+	end
+
 	const parent = self._parent
 	if parent then
 		parent._consumers[self] = nil
@@ -276,7 +457,7 @@ function Promise.cancel<T>(self: Promise<T>)
 		end
 	end
 
-	local consumersToCancel: { Promise<any> } = {}
+	const consumersToCancel: { AnyPromise } = {}
 	for consumer in self._consumers do
 		table.insert(consumersToCancel, consumer)
 	end
@@ -291,93 +472,198 @@ function Promise.cancel<T>(self: Promise<T>)
 	table.clear(self._rejectedCallbacks)
 end
 
-function Promise.catch<T>(self: Promise<T>, onRejected: (any) -> ...any): Promise<any>
+function PromisePrototype.catch(self: AnyPromise, onRejected: (reason: any) -> ...any): AnyPromise
+	if typeof(onRejected) ~= "function" then
+		error(`Promise:catch expects a function for onRejected, got: {typeof(onRejected)}`, 2)
+	end
 	return self:andThen(nil, onRejected)
 end
 
-function Promise.finally<T>(self: Promise<T>, onFinally: (() -> ...any)?): Promise<T>
-	if not onFinally then
+function PromisePrototype.finally(self: AnyPromise, onFinally: ((status: StatusType) -> ...any)?): AnyPromise
+	if onFinally == nil then
 		return self
 	end
-
-	self._unhandledRejection = false
-	const traceback = debug.traceback(nil, 2)
-
-	if self._status == Status.Cancelled then
-		task.spawn(runExecutor, traceback, onFinally)
-		local cancelledPromise = Promise.new(function() end) :: Promise<T>
-		cancelledPromise:cancel()
-		return cancelledPromise
+	if typeof(onFinally) ~= "function" then
+		error(`Promise:finally expects a function for onFinally, got: {typeof(onFinally)}`, 2)
 	end
 
-	local finallyPromise: Promise<T>
-	finallyPromise = Promise.new(function(resolve, reject, onCancel)
-		onCancel(function()
-			task.spawn(runExecutor, traceback, onFinally)
-		end)
+	const traceback = debug.traceback(nil, 2)
+	self._unhandledRejection = false
+
+	local handlerRan = false
+	local function runFinallyOnce(status: StatusType): (boolean, any)
+		if handlerRan then
+			return true, nil
+		end
+		handlerRan = true
+		const ok, result = runExecutor(traceback, onFinally, status)
+		return ok, result
+	end
+
+	if self._status == Status.Cancelled then
+		const cancelled = createInternalPromise(traceback, nil, nil)
+		cancelled:cancel()
+		task.spawn(runFinallyOnce, Status.Cancelled)
+		return cancelled
+	end
+
+	return createInternalPromise(traceback, function(resolve, reject, onCancel)
+		local function settleWithOriginalOutcome()
+			if self._status == Status.Resolved then
+				const values = self._values or {}
+				resolve(table.unpack(values, 1, self._valuesLength))
+			elseif self._status == Status.Rejected then
+				reject(self._reason)
+			end
+		end
 
 		local function finallyCallback()
-			const success, result = runExecutor(traceback, onFinally)
-			if not success then
+			const ok, result = runFinallyOnce(self._status)
+			if not ok then
 				reject(result)
 				return
 			end
 
-			local function passThroughOriginalOutcome()
-				if self._status == Status.Resolved then
-					const values = self._values or {}
-					resolve(table.unpack(values, 1, self._valuesLength))
-				elseif self._status == Status.Rejected then
-					reject(self._reason)
-				end
-			end
-
 			if Promise.is(result) then
-				const returnedPromise = result :: Promise<any>
-				if returnedPromise._status == Status.Cancelled then
-					if finallyPromise then
-						finallyPromise:cancel()
+				const returnedPromise = result :: AnyPromise
+				const continuation = returnedPromise:andThen(function()
+					if self._status == Status.Resolved then
+						const values = self._values or {}
+						return table.unpack(values, 1, self._valuesLength)
+					elseif self._status == Status.Rejected then
+						return Promise.reject(self._reason)
 					end
-					return
-				end
-				returnedPromise:andThen(passThroughOriginalOutcome, reject)
+					return nil
+				end)
+				resolve(continuation)
 			else
-				passThroughOriginalOutcome()
+				settleWithOriginalOutcome()
 			end
 		end
 
 		if self._status == Status.Started then
-			table.insert(self._fulfilledCallbacks, finallyCallback :: any)
-			table.insert(self._rejectedCallbacks, finallyCallback :: any)
-		else
-			task.spawn(finallyCallback)
-		end
-	end) :: Promise<T>
+			table.insert(self._fulfilledCallbacks, finallyCallback)
+			table.insert(self._rejectedCallbacks, finallyCallback)
 
-	if self._status == Status.Started and finallyPromise._status == Status.Started then
-		finallyPromise._parent = self
-		self._consumers[finallyPromise] = true
+			onCancel(function()
+				if self._status == Status.Started then
+					const fulfilledIndex = table.find(self._fulfilledCallbacks, finallyCallback)
+					if fulfilledIndex then
+						table.remove(self._fulfilledCallbacks, fulfilledIndex)
+					end
+
+					const rejectedIndex = table.find(self._rejectedCallbacks, finallyCallback)
+					if rejectedIndex then
+						table.remove(self._rejectedCallbacks, rejectedIndex)
+					end
+				end
+
+				runFinallyOnce(Status.Cancelled)
+			end)
+		else
+			finallyCallback()
+		end
+	end, self)
+end
+
+--[[
+	Yields the current thread until the Promise settles.
+	Returns the resolved value(s), or throws the rejection reason (or an
+	AlreadyCancelled PromiseError if the Promise was cancelled).
+]]
+function PromisePrototype.await(self: AnyPromise): ...any
+	const traceback = debug.traceback(nil, 2)
+	self._unhandledRejection = false
+
+	if self._status == Status.Started then
+		const callerThread = coroutine.running()
+		local resumed = false
+
+		local function resumeCaller()
+			if not resumed then
+				resumed = true
+				task.spawn(callerThread)
+			end
+		end
+
+		createInternalPromise(traceback, function(resolve, _, onCancel)
+			local function onSettled()
+				resolve(nil)
+				resumeCaller()
+			end
+
+			table.insert(self._fulfilledCallbacks, onSettled)
+			table.insert(self._rejectedCallbacks, onSettled)
+
+			onCancel(function()
+				if self._status == Status.Started then
+					const fulfilledIndex = table.find(self._fulfilledCallbacks, onSettled)
+					if fulfilledIndex then
+						table.remove(self._fulfilledCallbacks, fulfilledIndex)
+					end
+
+					const rejectedIndex = table.find(self._rejectedCallbacks, onSettled)
+					if rejectedIndex then
+						table.remove(self._rejectedCallbacks, rejectedIndex)
+					end
+				end
+				resumeCaller()
+			end)
+		end, self)
+
+		coroutine.yield()
 	end
 
-	return finallyPromise
+	self._unhandledRejection = false
+
+	if self._status == Status.Resolved then
+		const values = self._values or {}
+		return table.unpack(values, 1, self._valuesLength)
+	elseif self._status == Status.Rejected then
+		if self._reason == nil then
+			error("Promise rejected with nil.", 2)
+		end
+		error(self._reason, 0)
+	end
+
+	error(
+		PromiseError.new({
+			error = "Attempted to await a cancelled Promise.",
+			kind = PromiseError.Kind.AlreadyCancelled,
+			context = `Promise awaited at:\n{traceback}`,
+		}),
+		2
+	)
 end
 
 function Promise.resolve<T>(value: T): Promise<T>
-	return Promise.new(function(resolve)
-		resolve(value)
-	end)
+	const traceback = debug.traceback(nil, 2)
+	if Promise.is(value) then
+		return createInternalPromise(traceback, function(resolve)
+			resolve(value)
+		end, nil)
+	end
+
+	local resolved = createInternalPromise(traceback, nil, nil)
+	resolved._status = Status.Resolved
+	resolved._valuesLength = 1
+	resolved._values = { value }
+	return resolved
 end
 
 function Promise.reject(reason: any): Promise<any>
-	return Promise.new(function(_, reject)
-		reject(reason)
-	end)
+	const traceback = debug.traceback(nil, 2)
+	local rejected = createInternalPromise(traceback, nil, nil)
+	rejected._status = Status.Rejected
+	rejected._reason = reason
+	scheduleUnhandledRejectionCheck(rejected :: AnyPromise)
+	return rejected
 end
 
 --[[
 	Accepts an array of Promises and returns a new Promise that:
 	- Resolves with an array of all resolved values once every input Promise resolves.
-	- Rejects immediately if any input Promise rejects.
+	- Rejects immediately if any input Promise rejects, cancelling remaining derived consumers.
 ]]
 function Promise.all<T>(promises: { Promise<T> }): Promise<{ T }>
 	const traceback = debug.traceback(nil, 2)
@@ -386,34 +672,43 @@ function Promise.all<T>(promises: { Promise<T> }): Promise<{ T }>
 		error(`Promise.all expects a table of promises, got: {typeof(promises)}`, 2)
 	end
 
+	for index, promise in promises do
+		if not Promise.is(promise) then
+			error(`Promise.all expects every element to be a Promise, got {typeof(promise)} at index {index}`, 2)
+		end
+	end
+
 	if #promises == 0 then
 		return Promise.resolve({} :: { T })
 	end
 
-	return Promise.new(function(resolve, reject, onCancel)
+	for _, promise in promises do
+		if promise._status == Status.Cancelled then
+			const cancelled: Promise<{ T }> = createInternalPromise(traceback, nil, nil)
+			cancelled:cancel()
+			return cancelled
+		end
+	end
+
+	local allPromise: Promise<{ T }>
+	allPromise = createInternalPromise(traceback, function(resolve, reject, onCancel)
 		local resolvedValues: { T } = {}
+		local derivedPromises: { AnyPromise } = {}
 		local promisesRemaining = #promises
 		local isSettled = false
 
-		onCancel(function()
-			for _, promise in promises do
-				if Promise.is(promise) then
-					promise:cancel()
-				end
+		local function cancelDerived()
+			for _, derived in derivedPromises do
+				derived:cancel()
 			end
+		end
+
+		onCancel(function()
+			isSettled = true
+			cancelDerived()
 		end)
 
 		for index, promise in promises do
-			if not Promise.is(promise) then
-				isSettled = true
-				reject(PromiseError.new({
-					error = `Value at index {index} is not a Promise.`,
-					kind = PromiseError.Kind.ExecutionError,
-					trace = traceback,
-				}))
-				return
-			end
-
 			local function onFulfilled(value: T)
 				if isSettled then
 					return
@@ -421,7 +716,7 @@ function Promise.all<T>(promises: { Promise<T> }): Promise<{ T }>
 				resolvedValues[index] = value
 				promisesRemaining -= 1
 
-				if promisesRemaining <= 0 then
+				if promisesRemaining == 0 then
 					isSettled = true
 					resolve(resolvedValues)
 				end
@@ -432,17 +727,33 @@ function Promise.all<T>(promises: { Promise<T> }): Promise<{ T }>
 					return
 				end
 				isSettled = true
+				cancelDerived()
 				reject(err)
 			end
 
-			promise:andThen(onFulfilled, onRejected)
+			const derived = promise:andThen(onFulfilled, onRejected)
+			derivedPromises[index] = derived
+
+			const existingHook = derived._cancellationHook
+			derived._cancellationHook = function()
+				if existingHook then
+					existingHook()
+				end
+				if not isSettled and allPromise and allPromise._status == Status.Started then
+					isSettled = true
+					cancelDerived()
+					allPromise:cancel()
+				end
+			end
 		end
-	end) :: Promise<{ T }>
+	end, nil)
+
+	return allPromise
 end
 
 --[[
 	Accepts an array of Promises and returns a new Promise that settles as soon as
-	the first input Promise resolves or rejects.
+	the first input Promise resolves or rejects, cancelling losing derived consumers.
 ]]
 function Promise.race<T>(promises: { Promise<T> }): Promise<T>
 	const traceback = debug.traceback(nil, 2)
@@ -451,46 +762,121 @@ function Promise.race<T>(promises: { Promise<T> }): Promise<T>
 		error(`Promise.race expects a table of promises, got: {typeof(promises)}`, 2)
 	end
 
-	return Promise.new(function(resolve, reject, onCancel)
+	for index, promise in promises do
+		if not Promise.is(promise) then
+			error(`Promise.race expects every element to be a Promise, got {typeof(promise)} at index {index}`, 2)
+		end
+	end
+
+	if #promises > 0 then
+		local allAlreadyCancelled = true
+		for _, promise in promises do
+			if promise._status ~= Status.Cancelled then
+				allAlreadyCancelled = false
+				break
+			end
+		end
+		if allAlreadyCancelled then
+			const cancelled: Promise<T> = createInternalPromise(traceback, nil, nil)
+			cancelled:cancel()
+			return cancelled
+		end
+	end
+
+	local racePromise: Promise<T>
+	racePromise = createInternalPromise(traceback, function(resolve, reject, onCancel)
+		local derivedPromises: { AnyPromise } = {}
 		local isSettled = false
+		local cancelledCount = 0
+
+		local function cancelDerived()
+			for _, derived in derivedPromises do
+				derived:cancel()
+			end
+		end
 
 		onCancel(function()
-			for _, promise in promises do
-				if Promise.is(promise) then
-					promise:cancel()
-				end
-			end
+			isSettled = true
+			cancelDerived()
 		end)
 
-		for index, promise in promises do
-			if not Promise.is(promise) then
-				isSettled = true
-				reject(PromiseError.new({
-					error = `Value at index {index} is not a Promise.`,
-					kind = PromiseError.Kind.ExecutionError,
-					trace = traceback,
-				}))
-				return
-			end
+		if #promises == 0 then
+			return
+		end
 
+		for index, promise in promises do
 			local function onFulfilled(value: T)
-				if not isSettled then
-					isSettled = true
-					resolve(value)
+				if isSettled then
+					return
 				end
+				isSettled = true
+				cancelDerived()
+				resolve(value)
 			end
 
 			local function onRejected(err: any)
-				if not isSettled then
-					isSettled = true
-					reject(err)
+				if isSettled then
+					return
 				end
+				isSettled = true
+				cancelDerived()
+				reject(err)
 			end
 
-			promise:andThen(onFulfilled, onRejected)
+			const derived = promise:andThen(onFulfilled, onRejected)
+			derivedPromises[index] = derived
+
+			if derived._status == Status.Cancelled then
+				cancelledCount += 1
+			else
+				const existingHook = derived._cancellationHook
+				derived._cancellationHook = function()
+					if existingHook then
+						existingHook()
+					end
+					cancelledCount += 1
+					if
+						cancelledCount == #promises
+						and not isSettled
+						and racePromise
+						and racePromise._status == Status.Started
+					then
+						isSettled = true
+						racePromise:cancel()
+					end
+				end
+			end
 		end
-	end) :: Promise<T>
+	end, nil)
+
+	return racePromise
 end
+
+--[[
+	Returns a Promise that resolves with the elapsed duration after the specified
+	number of seconds. Cancelling the Promise cancels the underlying scheduled task.
+]]
+function Promise.delay(seconds: number): Promise<number>
+	if typeof(seconds) ~= "number" or seconds ~= seconds then
+		error(`Promise.delay expects a valid number of seconds, got: {tostring(seconds)}`, 2)
+	end
+
+	const traceback = debug.traceback(nil, 2)
+	return createInternalPromise(traceback, function(resolve, _, onCancel)
+		const startClock = os.clock()
+		const scheduledThread = task.delay(seconds, function()
+			resolve(os.clock() - startClock)
+		end)
+
+		onCancel(function()
+			if coroutine.status(scheduledThread) == "suspended" then
+				task.cancel(scheduledThread)
+			end
+		end)
+	end, nil)
+end
+
+local awaitMethod: <T>(self: Promise<T>) -> T = PromisePrototype.await :: any
 
 return table.freeze({
 	Status = Status,
@@ -501,4 +887,6 @@ return table.freeze({
 	race = Promise.race,
 	resolve = Promise.resolve,
 	reject = Promise.reject,
+	delay = Promise.delay,
+	await = awaitMethod,
 })
