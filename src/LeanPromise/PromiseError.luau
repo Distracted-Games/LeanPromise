@@ -25,15 +25,10 @@
 	Defines a rich error object for handling Promise rejections.
 ]]
 
-export type ErrorKind =
-	"ExecutionError"
+export type ErrorKind = "ExecutionError"
 	| "AlreadyCancelled"
 	| "NotResolvedInTime"
 	| "TimedOut"
-	| "Cancelled"
-	| "ConnectivityError"
-	| "DataStoreError"
-	| "SessionConflict"
 	| string
 
 export type PromiseErrorOptions = {
@@ -43,17 +38,19 @@ export type PromiseErrorOptions = {
 	kind: ErrorKind,
 }
 
-local ErrorKindEnum = {
+export type PromiseErrorExtendOptions = {
+	error: any?,
+	trace: string?,
+	context: string?,
+	kind: ErrorKind?,
+}
+
+const ErrorKindEnum = table.freeze({
 	ExecutionError = "ExecutionError" :: "ExecutionError",
 	AlreadyCancelled = "AlreadyCancelled" :: "AlreadyCancelled",
 	NotResolvedInTime = "NotResolvedInTime" :: "NotResolvedInTime",
 	TimedOut = "TimedOut" :: "TimedOut",
-	Cancelled = "Cancelled" :: "Cancelled",
-	ConnectivityError = "ConnectivityError" :: "ConnectivityError",
-	DataStoreError = "DataStoreError" :: "DataStoreError",
-	SessionConflict = "SessionConflict" :: "SessionConflict",
-}
-table.freeze(ErrorKindEnum)
+})
 
 local PromiseError = {}
 PromiseError.__index = PromiseError
@@ -89,13 +86,13 @@ function PromiseError.isKind(value: any, kind: ErrorKind): boolean
 	return PromiseError.is(value) and (value :: PromiseError).kind == kind
 end
 
-function PromiseError.extend(self: PromiseError, options: { kind: ErrorKind? }?): PromiseError
-	const resolvedKind = if options and options.kind then options.kind else self.kind
+function PromiseError.extend(self: PromiseError, options: PromiseErrorExtendOptions?): PromiseError
+	const opts: PromiseErrorExtendOptions = options or {}
 	return PromiseError.new({
-		error = self.error,
-		trace = self.trace,
-		context = self.context,
-		kind = resolvedKind,
+		error = if opts.error ~= nil then opts.error else self.error,
+		trace = opts.trace,
+		context = opts.context,
+		kind = opts.kind or self.kind,
 	}, self)
 end
 
