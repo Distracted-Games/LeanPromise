@@ -1,5 +1,9 @@
 --!strict
 --[[
+	LeanPromise
+	@author: DistractedGames
+	@version: 1.3.0
+
 	Copyright (c) 2019 Eryn L. K.
 	https://github.com/evaera/roblox-lua-promise
 
