@@ -32,9 +32,6 @@
 
 const PromiseError = require("@self/PromiseError")
 
-export type PromiseError = PromiseError.PromiseError
-export type StatusType = "Started" | "Resolved" | "Rejected" | "Cancelled"
-
 const Status = table.freeze({
 	Started = "Started" :: "Started",
 	Resolved = "Resolved" :: "Resolved",
@@ -42,37 +39,10 @@ const Status = table.freeze({
 	Cancelled = "Cancelled" :: "Cancelled",
 })
 
---[[
-	Creates an xpcall error handler that preserves PromiseError instances and custom
-	non-string error objects while wrapping string/nil errors in a rich PromiseError.
-]]
-local function makeErrorHandler(traceback: string): (err: any) -> any
-	return function(err: any): any
-		if PromiseError.is(err) then
-			return err
-		end
-		if err ~= nil and typeof(err) ~= "string" then
-			return err
-		end
-		return PromiseError.new({
-			error = err,
-			kind = PromiseError.Kind.ExecutionError,
-			trace = debug.traceback(tostring(err), 2),
-			context = `Promise created at:\n{traceback}`,
-		})
-	end
-end
+export type PromiseError = PromiseError.PromiseError
+export type StatusType = "Started" | "Resolved" | "Rejected" | "Cancelled"
 
---[[
-	Safely invokes a callback with xpcall and captures its return values or error reason.
-]]
-local function runExecutor(traceback: string, callback: (...any) -> ...any, ...: any): (boolean, ...any)
-	return xpcall(callback, makeErrorHandler(traceback), ...)
-end
-
-type PrototypeMetatable = {
-	__index: any,
-}
+type PrototypeMetatable = {}
 
 type AnyPromiseData = {
 	_status: StatusType,
@@ -134,13 +104,75 @@ type InternalExecutor = (
 	onCancel: (cancellationHook: (() -> ())?) -> boolean
 ) -> ()
 
-local PromisePrototype: { [string]: any } = {}
+const PromisePrototype: { [string]: any } = {}
 PromisePrototype.__index = PromisePrototype
 
-local Promise = {}
+const Promise = {}
+
+--[[
+	Creates an xpcall error handler that preserves PromiseError instances and custom
+	table error objects while wrapping primitive/string/nil errors in a PromiseError.
+]]
+local function makeErrorHandler(traceback: string): (err: any) -> any
+	return function(err: any): any
+		if PromiseError.is(err) or typeof(err) == "table" then
+			return err
+		end
+		return PromiseError.new({
+			error = err,
+			kind = PromiseError.Kind.ExecutionError,
+			trace = debug.traceback(tostring(err), 2),
+			context = `Promise created at:\n{traceback}`,
+		})
+	end
+end
+
+--[[
+	Safely invokes a callback with xpcall and captures its return values or error reason.
+]]
+local function runExecutor(traceback: string, callback: (...any) -> ...any, ...: any): (boolean, ...any)
+	return xpcall(callback, makeErrorHandler(traceback), ...)
+end
 
 function Promise.is(value: any): boolean
 	return typeof(value) == "table" and getmetatable(value) == PromisePrototype
+end
+
+local function dequeueCallbacks(target: AnyPromise, onFulfilled: ((...any) -> ())?, onRejected: ((any) -> ())?)
+	if target._status ~= Status.Started then
+		return
+	end
+
+	if onFulfilled then
+		const fulfilledIndex = table.find(target._fulfilledCallbacks, onFulfilled)
+		if fulfilledIndex then
+			table.remove(target._fulfilledCallbacks, fulfilledIndex)
+		end
+	end
+
+	if onRejected then
+		const rejectedIndex = table.find(target._rejectedCallbacks, onRejected)
+		if rejectedIndex then
+			table.remove(target._rejectedCallbacks, rejectedIndex)
+		end
+	end
+end
+
+local function attachCancelHook(target: AnyPromise, hook: () -> ())
+	if target._status == Status.Cancelled then
+		task.spawn(hook)
+		return
+	end
+
+	const previousHook = target._cancellationHook
+	if previousHook then
+		target._cancellationHook = function()
+			previousHook()
+			hook()
+		end
+	else
+		target._cancellationHook = hook
+	end
 end
 
 local function finalizePromise(self: AnyPromise)
@@ -166,7 +198,27 @@ local function scheduleUnhandledRejectionCheck(self: AnyPromise)
 	end)
 end
 
-local rejectPromise: (self: AnyPromise, reason: any) -> ()
+local function rejectPromise(self: AnyPromise, reason: any)
+	if self._status ~= Status.Started then
+		return
+	end
+
+	self._status = Status.Rejected
+	self._reason = reason
+
+	const callbacks = self._rejectedCallbacks
+	self._rejectedCallbacks = {}
+	const hadListeners = #callbacks > 0
+	finalizePromise(self)
+
+	if not hadListeners then
+		scheduleUnhandledRejectionCheck(self)
+	end
+
+	for _, callback in callbacks do
+		task.spawn(callback, reason)
+	end
+end
 
 local function resolvePromise(self: AnyPromise, ...: any)
 	if self._status ~= Status.Started then
@@ -175,9 +227,9 @@ local function resolvePromise(self: AnyPromise, ...: any)
 
 	if Promise.is((...)) then
 		if select("#", ...) > 1 then
-			warn(
-				`Promise resolved with multiple values where the first is a Promise; extra values ignored.\n{self._source}`
-			)
+			const warnMsg = "Promise resolved with multiple values where the first is a Promise; "
+				.. "extra values ignored."
+			warn(`{warnMsg}\n{self._source}`)
 		end
 
 		const chainedPromise = (...) :: AnyPromise
@@ -192,6 +244,8 @@ local function resolvePromise(self: AnyPromise, ...: any)
 			)
 			return
 		end
+
+		chainedPromise._unhandledRejection = false
 
 		if chainedPromise._status == Status.Cancelled then
 			self:cancel()
@@ -224,19 +278,9 @@ local function resolvePromise(self: AnyPromise, ...: any)
 		table.insert(chainedPromise._fulfilledCallbacks, onAdoptedFulfilled)
 		table.insert(chainedPromise._rejectedCallbacks, onAdoptedRejected)
 
-		self._cancellationHook = function()
-			if chainedPromise._status ~= Status.Started then
-				return
-			end
-			const fulfilledIndex = table.find(chainedPromise._fulfilledCallbacks, onAdoptedFulfilled)
-			if fulfilledIndex then
-				table.remove(chainedPromise._fulfilledCallbacks, fulfilledIndex)
-			end
-			const rejectedIndex = table.find(chainedPromise._rejectedCallbacks, onAdoptedRejected)
-			if rejectedIndex then
-				table.remove(chainedPromise._rejectedCallbacks, rejectedIndex)
-			end
-		end
+		attachCancelHook(self, function()
+			dequeueCallbacks(chainedPromise, onAdoptedFulfilled, onAdoptedRejected)
+		end)
 
 		return
 	end
@@ -254,34 +298,12 @@ local function resolvePromise(self: AnyPromise, ...: any)
 	end
 end
 
-rejectPromise = function(self: AnyPromise, reason: any)
-	if self._status ~= Status.Started then
-		return
-	end
-
-	self._status = Status.Rejected
-	self._reason = reason
-
-	const callbacks = self._rejectedCallbacks
-	self._rejectedCallbacks = {}
-	const hadListeners = #callbacks > 0
-	finalizePromise(self)
-
-	if not hadListeners then
-		scheduleUnhandledRejectionCheck(self)
-	end
-
-	for _, callback in callbacks do
-		task.spawn(callback, reason)
-	end
-end
-
 local function createInternalPromise(traceback: string, executor: InternalExecutor?, parent: AnyPromise?): any
 	if parent ~= nil and not Promise.is(parent) then
 		error("Argument #3 to createInternalPromise must be a Promise or nil", 2)
 	end
 
-	local self = (setmetatable({}, PromisePrototype) :: any) :: AnyPromise
+	const self = (setmetatable({}, PromisePrototype) :: any) :: AnyPromise
 	self._status = Status.Started
 	self._values = nil
 	self._valuesLength = -1
@@ -314,25 +336,25 @@ local function createInternalPromise(traceback: string, executor: InternalExecut
 
 	local function onCancel(cancellationHook: (() -> ())?): boolean
 		if cancellationHook then
-			if self._status == Status.Cancelled then
-				task.spawn(cancellationHook)
-			else
-				self._cancellationHook = cancellationHook
-			end
+			attachCancelHook(self, cancellationHook)
 		end
 
 		return self._status == Status.Cancelled
 	end
 
-	self._thread = task.spawn(function()
+	local threadCompleted = false
+	const executorThread = task.spawn(function()
 		const success, err = runExecutor(traceback, executor, resolve, reject, onCancel)
-		if self._status == Status.Started then
-			self._thread = nil
-		end
+		threadCompleted = true
+		self._thread = nil
 		if not success then
 			rejectPromise(self, err)
 		end
 	end)
+
+	if not threadCompleted and self._status == Status.Started then
+		self._thread = executorThread
+	end
 
 	return self
 end
@@ -406,19 +428,7 @@ function PromisePrototype.andThen(
 			table.insert(self._rejectedCallbacks, failureCallback)
 
 			onCancel(function()
-				if self._status ~= Status.Started then
-					return
-				end
-
-				const fulfilledIndex = table.find(self._fulfilledCallbacks, successCallback)
-				if fulfilledIndex then
-					table.remove(self._fulfilledCallbacks, fulfilledIndex)
-				end
-
-				const rejectedIndex = table.find(self._rejectedCallbacks, failureCallback)
-				if rejectedIndex then
-					table.remove(self._rejectedCallbacks, rejectedIndex)
-				end
+				dequeueCallbacks(self, successCallback, failureCallback)
 			end)
 		elseif self._status == Status.Resolved then
 			const values = self._values or {}
@@ -444,8 +454,10 @@ function PromisePrototype.cancel(self: AnyPromise)
 
 	const executorThread = self._thread
 	self._thread = nil
-	if executorThread and executorThread ~= coroutine.running() and coroutine.status(executorThread) == "suspended" then
-		pcall(task.cancel, executorThread)
+	if executorThread and executorThread ~= coroutine.running() then
+		if coroutine.status(executorThread) == "suspended" then
+			pcall(task.cancel, executorThread)
+		end
 	end
 
 	const parent = self._parent
@@ -546,18 +558,7 @@ function PromisePrototype.finally(self: AnyPromise, onFinally: ((status: StatusT
 			table.insert(self._rejectedCallbacks, finallyCallback)
 
 			onCancel(function()
-				if self._status == Status.Started then
-					const fulfilledIndex = table.find(self._fulfilledCallbacks, finallyCallback)
-					if fulfilledIndex then
-						table.remove(self._fulfilledCallbacks, fulfilledIndex)
-					end
-
-					const rejectedIndex = table.find(self._rejectedCallbacks, finallyCallback)
-					if rejectedIndex then
-						table.remove(self._rejectedCallbacks, rejectedIndex)
-					end
-				end
-
+				dequeueCallbacks(self, finallyCallback, finallyCallback)
 				runFinallyOnce(Status.Cancelled)
 			end)
 		else
@@ -582,7 +583,9 @@ function PromisePrototype.await(self: AnyPromise): ...any
 		local function resumeCaller()
 			if not resumed then
 				resumed = true
-				task.spawn(callerThread)
+				if coroutine.status(callerThread) == "suspended" then
+					task.spawn(callerThread)
+				end
 			end
 		end
 
@@ -596,17 +599,7 @@ function PromisePrototype.await(self: AnyPromise): ...any
 			table.insert(self._rejectedCallbacks, onSettled)
 
 			onCancel(function()
-				if self._status == Status.Started then
-					const fulfilledIndex = table.find(self._fulfilledCallbacks, onSettled)
-					if fulfilledIndex then
-						table.remove(self._fulfilledCallbacks, fulfilledIndex)
-					end
-
-					const rejectedIndex = table.find(self._rejectedCallbacks, onSettled)
-					if rejectedIndex then
-						table.remove(self._rejectedCallbacks, rejectedIndex)
-					end
-				end
+				dequeueCallbacks(self, onSettled, onSettled)
 				resumeCaller()
 			end)
 		end, self)
@@ -644,7 +637,7 @@ function Promise.resolve<T>(value: T): Promise<T>
 		end, nil)
 	end
 
-	local resolved = createInternalPromise(traceback, nil, nil)
+	const resolved = createInternalPromise(traceback, nil, nil)
 	resolved._status = Status.Resolved
 	resolved._valuesLength = 1
 	resolved._values = { value }
@@ -653,7 +646,7 @@ end
 
 function Promise.reject(reason: any): Promise<any>
 	const traceback = debug.traceback(nil, 2)
-	local rejected = createInternalPromise(traceback, nil, nil)
+	const rejected = createInternalPromise(traceback, nil, nil)
 	rejected._status = Status.Rejected
 	rejected._reason = reason
 	scheduleUnhandledRejectionCheck(rejected :: AnyPromise)
@@ -674,7 +667,9 @@ function Promise.all<T>(promises: { Promise<T> }): Promise<{ T }>
 
 	for index, promise in promises do
 		if not Promise.is(promise) then
-			error(`Promise.all expects every element to be a Promise, got {typeof(promise)} at index {index}`, 2)
+			const errMsg = `Promise.all expects every element to be a Promise, `
+				.. `got {typeof(promise)} at index {index}`
+			error(errMsg, 2)
 		end
 	end
 
@@ -691,9 +686,11 @@ function Promise.all<T>(promises: { Promise<T> }): Promise<{ T }>
 	end
 
 	local allPromise: Promise<{ T }>
+	local shouldCancelSelf = false
+
 	allPromise = createInternalPromise(traceback, function(resolve, reject, onCancel)
-		local resolvedValues: { T } = {}
-		local derivedPromises: { AnyPromise } = {}
+		const resolvedValues: { T } = {}
+		const derivedPromises: { AnyPromise } = {}
 		local promisesRemaining = #promises
 		local isSettled = false
 
@@ -734,19 +731,27 @@ function Promise.all<T>(promises: { Promise<T> }): Promise<{ T }>
 			const derived = promise:andThen(onFulfilled, onRejected)
 			derivedPromises[index] = derived
 
-			const existingHook = derived._cancellationHook
-			derived._cancellationHook = function()
-				if existingHook then
-					existingHook()
-				end
-				if not isSettled and allPromise and allPromise._status == Status.Started then
+			attachCancelHook(derived, function()
+				if not isSettled then
 					isSettled = true
 					cancelDerived()
-					allPromise:cancel()
+					if allPromise and allPromise._status == Status.Started then
+						allPromise:cancel()
+					else
+						shouldCancelSelf = true
+					end
 				end
-			end
+			end)
+		end
+
+		if isSettled then
+			cancelDerived()
 		end
 	end, nil)
+
+	if shouldCancelSelf and allPromise._status == Status.Started then
+		allPromise:cancel()
+	end
 
 	return allPromise
 end
@@ -764,7 +769,9 @@ function Promise.race<T>(promises: { Promise<T> }): Promise<T>
 
 	for index, promise in promises do
 		if not Promise.is(promise) then
-			error(`Promise.race expects every element to be a Promise, got {typeof(promise)} at index {index}`, 2)
+			const errMsg = `Promise.race expects every element to be a Promise, `
+				.. `got {typeof(promise)} at index {index}`
+			error(errMsg, 2)
 		end
 	end
 
@@ -784,8 +791,10 @@ function Promise.race<T>(promises: { Promise<T> }): Promise<T>
 	end
 
 	local racePromise: Promise<T>
+	local shouldCancelSelf = false
+
 	racePromise = createInternalPromise(traceback, function(resolve, reject, onCancel)
-		local derivedPromises: { AnyPromise } = {}
+		const derivedPromises: { AnyPromise } = {}
 		local isSettled = false
 		local cancelledCount = 0
 
@@ -829,25 +838,31 @@ function Promise.race<T>(promises: { Promise<T> }): Promise<T>
 			if derived._status == Status.Cancelled then
 				cancelledCount += 1
 			else
-				const existingHook = derived._cancellationHook
-				derived._cancellationHook = function()
-					if existingHook then
-						existingHook()
-					end
+				attachCancelHook(derived, function()
 					cancelledCount += 1
-					if
-						cancelledCount == #promises
-						and not isSettled
-						and racePromise
-						and racePromise._status == Status.Started
-					then
+					if cancelledCount == #promises and not isSettled then
 						isSettled = true
-						racePromise:cancel()
+						if racePromise and racePromise._status == Status.Started then
+							racePromise:cancel()
+						else
+							shouldCancelSelf = true
+						end
 					end
-				end
+				end)
 			end
 		end
+
+		if isSettled then
+			cancelDerived()
+		elseif cancelledCount == #promises then
+			isSettled = true
+			shouldCancelSelf = true
+		end
 	end, nil)
+
+	if shouldCancelSelf and racePromise._status == Status.Started then
+		racePromise:cancel()
+	end
 
 	return racePromise
 end
@@ -876,7 +891,7 @@ function Promise.delay(seconds: number): Promise<number>
 	end, nil)
 end
 
-local awaitMethod: <T>(self: Promise<T>) -> T = PromisePrototype.await :: any
+const awaitMethod: <T>(self: Promise<T>) -> T = PromisePrototype.await :: any
 
 return table.freeze({
 	Status = Status,

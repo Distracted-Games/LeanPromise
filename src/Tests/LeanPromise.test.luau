@@ -502,4 +502,90 @@ function TestSuite.TestPromiseErrorExtendDoesNotDuplicateTrace()
 	assert(childContextCount == 1, `Expected ChildExtraContext once in tostring, appeared {childContextCount} times`)
 end
 
+function TestSuite.TestAdoptionPreservesExecutorOnCancelHooks()
+	local innerCleanedUp = false
+	local outerCleanedUpBefore = false
+	local outerCleanedUpAfter = false
+
+	const inner = Promise.new(function(_, _, onCancel)
+		onCancel(function()
+			innerCleanedUp = true
+		end)
+	end)
+
+	const outer = Promise.new(function(resolve, _, onCancel)
+		onCancel(function()
+			outerCleanedUpBefore = true
+		end)
+		resolve(inner)
+		onCancel(function()
+			outerCleanedUpAfter = true
+		end)
+	end)
+
+	outer:cancel()
+	task.wait(0.02)
+
+	assert(outerCleanedUpBefore, "onCancel hook registered before resolve(inner) was clobbered")
+	assert(outerCleanedUpAfter, "onCancel hook registered after resolve(inner) did not run")
+	assert(innerCleanedUp, "Adopted inner promise was not cancelled when outer cancelled")
+end
+
+function TestSuite.TestAdoptedRejectAndFinallyInnerPromiseNoSpuriousWarning()
+	local caughtReason: any = nil
+	Promise.resolve(1)
+		:andThen(function()
+			return Promise.reject("HandledDownstream")
+		end)
+		:finally(function()
+			return Promise.delay(0.01)
+		end)
+		:catch(function(err)
+			caughtReason = err
+		end)
+
+	task.wait(0.05)
+	assert(caughtReason == "HandledDownstream", `Expected HandledDownstream, got {tostring(caughtReason)}`)
+end
+
+function TestSuite.TestAllAndRaceSyncEarlySettleCancelsRemainingInputs()
+	local raceSlowCancelled = false
+	const raceSlow = Promise.new(function(_: (number) -> (), _, onCancel)
+		onCancel(function()
+			raceSlowCancelled = true
+		end)
+	end)
+
+	const raceWinner = Promise.race({ Promise.resolve(1), raceSlow }):await()
+	task.wait(0.02)
+	assert(raceWinner == 1, "Expected sync race winner to be 1")
+	assert(raceSlowCancelled, "Promise.race failed to cancel remaining inputs after sync early resolution")
+
+	local allSlowCancelled = false
+	const allSlow = Promise.new(function(_: (number) -> (), _, onCancel)
+		onCancel(function()
+			allSlowCancelled = true
+		end)
+	end)
+
+	const okAll, allErr: any = pcall(function()
+		return Promise.all({ Promise.reject("SyncFail"), allSlow }):await()
+	end)
+	task.wait(0.02)
+	assert(not okAll and allErr == "SyncFail", "Expected SyncFail rejection from Promise.all")
+	assert(allSlowCancelled, "Promise.all failed to cancel remaining inputs after sync early rejection")
+end
+
+function TestSuite.TestThrownPrimitiveWrapsInPromiseError()
+	const ok, err = pcall(function()
+		return Promise.new(function()
+			error(404)
+		end):await()
+	end)
+	assert(
+		not ok and PromiseError.isKind(err, PromiseError.Kind.ExecutionError),
+		`Expected thrown number to wrap in ExecutionError PromiseError, got {tostring(err)}`
+	)
+end
+
 return TestSuite

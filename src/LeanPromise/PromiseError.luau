@@ -25,6 +25,13 @@
 	Defines a rich error object for handling Promise rejections.
 ]]
 
+const ERROR_KIND_ENUM = table.freeze({
+	ExecutionError = "ExecutionError" :: "ExecutionError",
+	AlreadyCancelled = "AlreadyCancelled" :: "AlreadyCancelled",
+	NotResolvedInTime = "NotResolvedInTime" :: "NotResolvedInTime",
+	TimedOut = "TimedOut" :: "TimedOut",
+})
+
 export type ErrorKind = "ExecutionError"
 	| "AlreadyCancelled"
 	| "NotResolvedInTime"
@@ -45,14 +52,7 @@ export type PromiseErrorExtendOptions = {
 	kind: ErrorKind?,
 }
 
-const ErrorKindEnum = table.freeze({
-	ExecutionError = "ExecutionError" :: "ExecutionError",
-	AlreadyCancelled = "AlreadyCancelled" :: "AlreadyCancelled",
-	NotResolvedInTime = "NotResolvedInTime" :: "NotResolvedInTime",
-	TimedOut = "TimedOut" :: "TimedOut",
-})
-
-local PromiseError = {}
+const PromiseError = {}
 PromiseError.__index = PromiseError
 
 type PromiseErrorData = {
@@ -67,8 +67,11 @@ type PromiseErrorData = {
 export type PromiseError = setmetatable<PromiseErrorData, typeof(PromiseError)>
 
 function PromiseError.new(options: PromiseErrorOptions, parent: PromiseError?): PromiseError
-	local self = setmetatable({}, PromiseError) :: PromiseError
-	self.error = if options.error ~= nil then tostring(options.error) else "[This error has no error text.]"
+	const defaultText = "[This error has no error text.]"
+	const errorText = if options.error ~= nil then tostring(options.error) else defaultText
+
+	const self = setmetatable({}, PromiseError) :: PromiseError
+	self.error = errorText
 	self.trace = options.trace
 	self.context = options.context
 	self.kind = options.kind
@@ -97,7 +100,7 @@ function PromiseError.extend(self: PromiseError, options: PromiseErrorExtendOpti
 end
 
 function PromiseError.getErrorChain(self: PromiseError): { PromiseError }
-	local errorChain: { PromiseError } = { self }
+	const errorChain: { PromiseError } = { self }
 	local current: PromiseError = self
 	while current.parent do
 		table.insert(errorChain, current.parent)
@@ -108,9 +111,9 @@ function PromiseError.getErrorChain(self: PromiseError): { PromiseError }
 end
 
 function PromiseError.__tostring(self: PromiseError): string
-	local errorStrings = { `--- Promise Error ({self.kind}) ---` }
+	const errorStrings = { `--- Promise Error ({self.kind}) ---` }
 	for _, err in PromiseError.getErrorChain(self) do
-		local parts: { string } = {}
+		const parts: { string } = {}
 		if err.trace then
 			table.insert(parts, err.trace)
 		else
@@ -126,7 +129,7 @@ function PromiseError.__tostring(self: PromiseError): string
 end
 
 return table.freeze({
-	Kind = ErrorKindEnum,
+	Kind = ERROR_KIND_ENUM,
 	new = PromiseError.new,
 	is = PromiseError.is,
 	isKind = PromiseError.isKind,
